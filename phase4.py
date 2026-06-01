@@ -683,7 +683,7 @@ def run():
         print(f"[PHASE4] ✅ {symbol} bot started", flush=True)
         time.sleep(2)  # stagger starts
 from phase4_server import start_server
-start_server(bots)
+    start_server(bots)
     alert("⚡ PHASE4 V1.0 ONLINE | NUGT+SOXL+LABU+TQQQ | Bear pairs active")
     print("[PHASE4] All bots running. Holding main thread.", flush=True)
 
