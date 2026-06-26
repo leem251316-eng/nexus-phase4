@@ -67,12 +67,20 @@ import time
 import uuid
 import traceback
 import threading
+import warnings
 import requests
 import pandas as pd
 import numpy as np
 import yfinance as yf
 from datetime import datetime
 from zoneinfo import ZoneInfo
+
+# Suppress yfinance DeprecationWarnings about NumPy timedelta 'generic' unit.
+# These are internal to yfinance/pandas and will be fixed in a future yfinance
+# release. They have zero effect on behavior and just pollute Railway logs with
+# red warning lines that look like errors but aren't.
+warnings.filterwarnings("ignore", category=DeprecationWarning, module="yfinance")
+warnings.filterwarnings("ignore", message=".*generic.*unit.*NumPy timedelta.*")
 
 try:
     import psycopg2
