@@ -1727,7 +1727,7 @@ class SymbolBot:
 # ── Phase4 Service ────────────────────────────────────────────────────────────
 def run():
     global _phase4_memory
-    print("[PHASE4] NEXUS PHASE 4 V1.8 STARTING", flush=True)
+    print("[PHASE4] NEXUS PHASE 4 V1.9 STARTING", flush=True)
     print("[PHASE4] Bots: NUGT(30%) | SOXL(25%) | LABU(25%) | TQQQ(20%)", flush=True)
     print("[PHASE4] Bear pairs: DUST | SOXS | LABD" + (" | SQQQ" if SQQQ_ENABLED else " | SQQQ(DISABLED)"), flush=True)
     print("[PHASE4] V1.6: Confluence score entry | Underlying index | ATR stops | Adaptive ratchet", flush=True)
