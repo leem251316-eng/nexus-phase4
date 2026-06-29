@@ -320,9 +320,13 @@ def is_market_hours() -> bool:
 
 
 # ── Alpaca data layer ─────────────────────────────────────────────────────────
-def _bars_to_lists(bars_dict: dict, sym: str) -> tuple:
-    """Extract (closes, volumes) from Alpaca bars dict for a symbol."""
-    bars = bars_dict.get(sym, [])
+def _bars_to_lists(bars_result, sym: str) -> tuple:
+    """Extract (closes, volumes) from Alpaca bars result for a symbol.
+    BarSet supports [] access but not .get() -- use try/except."""
+    try:
+        bars = bars_result[sym]
+    except (KeyError, TypeError):
+        return [], []
     closes  = [float(b.close)  for b in bars]
     volumes = [float(b.volume) for b in bars]
     return closes, volumes
@@ -345,17 +349,17 @@ def refresh_all_prices():
         )
         with _context_lock:
             for sym in ALL_SYMBOLS:
-                if sym in latest:
+                try:
                     _latest_prices[sym] = float(latest[sym].price)
+                except (KeyError, TypeError):
+                    pass
 
         # VIX via VIXY: VIXY price * 10 ≈ VIX (same approach as main.py V10.19)
-        if "VIXY" in _latest_prices:
-            vixy = _latest_prices["VIXY"]
-            if vixy > 0:
-                raw_vix = vixy * 10.0
-                with _context_lock:
-                    # 3-reading smooth to avoid single-bar whipsaws
-                    _vix_smooth = (_vix_smooth * 0.7) + (raw_vix * 0.3)
+        vixy = _latest_prices.get("VIXY", 0)
+        if vixy and vixy > 0:
+            raw_vix = vixy * 10.0
+            with _context_lock:
+                _vix_smooth = (_vix_smooth * 0.7) + (raw_vix * 0.3)
 
     except Exception as e:
         print(f"[P4 DATA] latest price fetch error: {e}", flush=True)
