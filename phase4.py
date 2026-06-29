@@ -35,7 +35,7 @@ import traceback
 import requests
 import pandas as pd
 import numpy as np
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 
 try:
@@ -352,7 +352,7 @@ def fetch_prices_and_volumes(symbol: str, bars: int = 40, interval: str = "1m") 
             req      = StockBarsRequest(
                 symbol_or_symbols=alpaca_sym,
                 timeframe=tf,
-                start=datetime.utcnow() - lookback,
+                start=datetime.now(timezone.utc) - lookback,
                 feed="iex",
             )
             df = _data_client.get_stock_bars(req).df
@@ -389,7 +389,7 @@ def get_current_price(symbol: str) -> float | None:
             req = StockBarsRequest(
                 symbol_or_symbols=alpaca_sym,
                 timeframe=TimeFrame.Minute,
-                start=datetime.utcnow() - timedelta(minutes=5),
+                start=datetime.now(timezone.utc) - timedelta(minutes=5),
                 feed="iex",
             )
             df = _data_client.get_stock_bars(req).df
