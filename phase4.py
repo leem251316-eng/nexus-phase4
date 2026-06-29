@@ -1,5 +1,5 @@
 """
-NEXUS PHASE 4 — PER-SYMBOL AUTONOMOUS BOTS V1.9
+NEXUS PHASE 4 — PER-SYMBOL AUTONOMOUS BOTS V2.0
 4 dedicated bots: NUGT, SOXL, LABU, TQQQ
 Each reads full market context, selects a trading mode, executes independently.
 
@@ -14,73 +14,54 @@ Bear pairs: each bot monitors bull RSI exhaustion -> flips to bear ETF on revers
 Capital allocation (by EV from nexus_analyzer 2yr + 1yr backtest):
   NUGT 30% | SOXL 25% | LABU 25% | TQQQ 20%
 
-V1.9 — Strategy fixes (Jun 26 2026 audit):
-  WIN_RATE_GATE_THRESHOLD raised 35%->45%: same fix as Berserker/Scanner --
-    35% WR with typical Phase4 TP/stop ratios produces negative EV. 45% is
-    the minimum where the math works at current risk parameters.
-  SQQQ_ENABLED now defaults to True with an SPY bear regime guard:
-    SQQQ only fires when SPY is below its 20-day MA (bear regime confirmed).
-    Disabled by default during bull markets, auto-enables in corrections.
-    The original backtest negative EV was over a 2yr sample dominated by the
-    2024-2025 bull run. Bear regime guard ensures SQQQ only trades when macro
-    conditions actually support it.
-  VIX staleness logging: when yfinance fails to fetch VIX data, the regime
-    gates (>28 caution, >35 pause) silently use the 15.0 default. Added a
-    warning log when VIX data is more than 5 minutes stale.
+V2.0 — Alpaca migration + intelligence upgrades (Jun 29 2026):
+  BROKER MIGRATION: Webull -> Alpaca
+    ✅ Replaced unofficial Webull API with alpaca-py TradingClient
+    ✅ Replaced yfinance (delayed, unreliable) with Alpaca IEX real-time bars
+    ✅ Fractional share support via notional orders -- 100% capital deployment
+    ✅ Batch fetching: all 14 symbols (ETFs + underlyings + SPY/QQQ/VIXY) in 3 API calls
+    ✅ VIX via VIXY ETF through Alpaca IEX (same as main.py V10.19)
+    ✅ Removed: webull, yfinance imports, acct_id threading, Webull 429 backoff
+    ✅ Env vars: ALPACA_PHASE4_API_KEY, ALPACA_PHASE4_SECRET_KEY
 
-V1.8 — Score + StochRSI fixes:
-  compute_stochrsi() upgraded to Wilder EWM smoothing inside the RSI
-  calculation -- the simple rolling mean was inconsistent with compute_rsi()
-  and understated StochRSI oversold readings, causing some genuine oversold
-  entries to miss the stochrsi_oversold flag.
-  compute_entry_score() double-counting fix: neutral signals (not in best,
-  not in worst) no longer add +1 -- only explicit best_signals score positive.
-  This prevents irrelevant noise signals from padding the score past min_score
-  and matches the intent of the backtest-derived best/worst signal lists.
+  INTELLIGENCE UPGRADES:
+    ✅ ADX regime filter: ADX < 20 = ranging market -> disable RIDE/EXTENDED modes,
+       SCALP only. Prevents trend-following in choppy conditions.
+    ✅ Volume confirmation gate: entry bar volume must be > 1.2x avg of prior 10 bars.
+       Reversal candles on below-average volume are traps -- not real institutional buying.
+    ✅ Underlying-based exit signal: when the underlying index (SMH for SOXL, etc.)
+       starts reversing (RSI curl down from overbought, MACD cross bearish),
+       exit the bull ETF position BEFORE the ETF's own trail stop fires.
+       Underlying moves first -- ETF follows with 3x leverage 1-2 min later.
+    ✅ Per-bot daily loss limit: each bot tracks daily_pnl. If bot hits -3% for the day,
+       it pauses until next market open. Other bots continue unaffected.
+    ✅ WIN_RATE_GATE_THRESHOLD remains 0.45 (correct mathematical threshold)
 
-V1.7 — RSI fix:
-  compute_rsi() upgraded to Wilder EWM smoothing (alpha=1/period).
-  Replaces simple rolling mean which was noisier and triggered more
-  false signals in both bull entries and RSI overbought exits.
-  Matches main.py V10.9 and industry standard Wilder RSI.
-
-V1.6 — Complete entry/exit overhaul:
-  ENTRY:
-  - Replaced single RSI gate with per-symbol confluence scoring (15 signals)
-  - Per-symbol signal weights from strategy_recipes best/worst signal data
-  - Underlying index context: SMH (SOXL/SOXS), QQQ (TQQQ/SQQQ),
-    GDX (NUGT/DUST), XBI (LABU/LABD) — the tide that moves the boat
-  - Multi-timeframe: 5-min structure check before 1-min trigger
-  - Asymmetric position sizing by conviction level (signal boost 0/1/2)
-  - Reversal quality scoring — high/medium/skip, affects size
-  - Bear trap detection: underlying at highs + volume expanding = skip reversal
-  EXIT:
-  - ATR-based stops (derived from avg MAE) — adapts to actual volatility
-  - Adaptive ratchet: two-phase trailing (early trail, then tighten at momentum peak)
-  - Signal reversal exit: RSI hits overbought zone -> mean reversion complete
-  - Time-in-dwell: flat position after 30 min = thesis failed, exit clean
-  - VIX regime: VIX > 28 = reduce sizes 50%, VIX > 35 = pause bull entries
+V1.9 — SQQQ gate fix: SPY bear regime check before SQQQ entries.
+V1.8 — Score + StochRSI fixes.
+V1.7 — RSI Wilder EWM fix.
+V1.6 — Complete entry/exit overhaul (confluence scoring, underlying tide, ATR stops).
 """
 
 import os
 import time
-import uuid
+import secrets
 import traceback
 import threading
-import warnings
 import requests
 import pandas as pd
 import numpy as np
-import yfinance as yf
-from datetime import datetime
+from collections import deque
+from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 
-# Suppress yfinance DeprecationWarnings about NumPy timedelta 'generic' unit.
-# These are internal to yfinance/pandas and will be fixed in a future yfinance
-# release. They have zero effect on behavior and just pollute Railway logs with
-# red warning lines that look like errors but aren't.
-warnings.filterwarnings("ignore", category=DeprecationWarning, module="yfinance")
-warnings.filterwarnings("ignore", message=".*generic.*unit.*NumPy timedelta.*")
+from alpaca.trading.client import TradingClient
+from alpaca.trading.requests import MarketOrderRequest, GetOrdersRequest
+from alpaca.trading.enums import OrderSide, TimeInForce, QueryOrderStatus
+from alpaca.data.historical import StockHistoricalDataClient
+from alpaca.data.requests import StockLatestTradeRequest, StockBarsRequest
+from alpaca.data.timeframe import TimeFrame, TimeFrameUnit
+from alpaca.data.enums import DataFeed
 
 try:
     import psycopg2
@@ -89,38 +70,39 @@ try:
 except ImportError:
     _db_available = False
 
-from webull.core.client import ApiClient
-from webull.trade.trade_client import TradeClient
-
 # ── Env ───────────────────────────────────────────────────────────────────────
-APP_KEY          = os.environ.get("WEBULL_APP_KEY")
-APP_SECRET       = os.environ.get("WEBULL_APP_SECRET")
-ACCOUNT_ID       = os.environ.get("WEBULL_ACCOUNT_ID")
-TELEGRAM_TOKEN   = os.environ.get("TELEGRAM_TOKEN")
-TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
+ALPACA_API_KEY   = os.environ.get("ALPACA_PHASE4_API_KEY", "")
+ALPACA_SECRET    = os.environ.get("ALPACA_PHASE4_SECRET_KEY", "")
+TELEGRAM_TOKEN   = os.environ.get("TELEGRAM_TOKEN", "")
+TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
 DATABASE_URL     = os.environ.get("DATABASE_URL", "")
 ANALYST_URL      = os.environ.get("ANALYST_URL", "").rstrip("/")
 NEXUS_TOKEN      = os.environ.get("NEXUS_INTERNAL_TOKEN", "")
-# V1.9: SQQQ enabled by default -- guarded by SPY bear regime check in check_reversal()
-# Override: set PHASE4_SQQQ_ENABLED=false to disable entirely
 SQQQ_ENABLED     = os.environ.get("PHASE4_SQQQ_ENABLED", "true").lower() == "true"
+IS_PAPER         = os.environ.get("ALPACA_PHASE4_PAPER", "false").lower() == "true"
 
 CENTRAL  = ZoneInfo("America/Chicago")
 BOT_NAME = "PHASE4"
 
+# ── Alpaca clients ────────────────────────────────────────────────────────────
+trading_client    = TradingClient(ALPACA_API_KEY, ALPACA_SECRET, paper=IS_PAPER)
+stock_data_client = StockHistoricalDataClient(ALPACA_API_KEY, ALPACA_SECRET)
+
+# All symbols we need to fetch -- batched in single API calls
+ALL_ETFS        = ["NUGT", "SOXL", "LABU", "TQQQ", "DUST", "SOXS", "LABD", "SQQQ"]
+ALL_UNDERLYINGS = ["GDX", "SMH", "XBI", "QQQ"]
+ALL_CONTEXT     = ["SPY", "VIXY"]
+ALL_SYMBOLS     = ALL_ETFS + ALL_UNDERLYINGS + ALL_CONTEXT
+
+_order_lock = threading.Lock()
+
 # ── Per-symbol config ─────────────────────────────────────────────────────────
-# V1.6: exit params derived from recipe avg MAE/MFE data
-# atr_stop      = 1.2x avg MAE  (adapts to symbol volatility)
-# early_ratchet = 0.38x avg MFE (start trailing early)
-# late_ratchet  = 0.72x avg MFE (tighten trail at momentum peak)
-# trail_normal  = 0.22x avg MAE
-# trail_tight   = 0.15x avg MAE (used when RSI overbought)
 BOT_CONFIGS = {
     "NUGT": {
         "bear_pair":      "DUST",
         "underlying":     "GDX",
         "budget_pct":     0.30,
-        "min_score":      5,       # score>=5: 55.5% WR / 128 trades / EV+0.07%
+        "min_score":      5,
         "atr_stop":       0.0213,
         "early_ratchet":  0.0059,
         "late_ratchet":   0.0111,
@@ -128,17 +110,17 @@ BOT_CONFIGS = {
         "trail_tight":    0.0027,
         "avoid_hours":    [9],
         "avoid_days":     [],
-        # Signals from recipe best/worst
         "best_signals":   ["rsi_lt40", "bb_squeeze", "below_ma20", "rsi14_lt35"],
         "worst_signals":  ["near_lower_bb", "ema9_above_ema21"],
         "ride_stop_mult": 1.3,
         "ext_stop_mult":  1.8,
+        "daily_loss_limit": 0.03,
     },
     "SOXL": {
         "bear_pair":      "SOXS",
         "underlying":     "SMH",
         "budget_pct":     0.25,
-        "min_score":      6,       # score>=6: 65.9% WR / 214 trades / EV+0.44%
+        "min_score":      6,
         "atr_stop":       0.0159,
         "early_ratchet":  0.0051,
         "late_ratchet":   0.0097,
@@ -150,12 +132,13 @@ BOT_CONFIGS = {
         "worst_signals":  ["macd_bullish", "below_ma20"],
         "ride_stop_mult": 1.3,
         "ext_stop_mult":  1.8,
+        "daily_loss_limit": 0.03,
     },
     "LABU": {
         "bear_pair":      "LABD",
         "underlying":     "XBI",
         "budget_pct":     0.25,
-        "min_score":      6,       # score>=6: 57.7% WR / 97 trades / EV+0.13%
+        "min_score":      6,
         "atr_stop":       0.0193,
         "early_ratchet":  0.0054,
         "late_ratchet":   0.0101,
@@ -167,12 +150,13 @@ BOT_CONFIGS = {
         "worst_signals":  ["ema9_above_ema21", "near_lower_bb"],
         "ride_stop_mult": 1.3,
         "ext_stop_mult":  1.8,
+        "daily_loss_limit": 0.03,
     },
     "TQQQ": {
         "bear_pair":      "SQQQ",
         "underlying":     "QQQ",
         "budget_pct":     0.20,
-        "min_score":      4,       # score>=4: 62.7% WR / 158 trades / EV+0.37%
+        "min_score":      4,
         "atr_stop":       0.0151,
         "early_ratchet":  0.0051,
         "late_ratchet":   0.0097,
@@ -184,14 +168,14 @@ BOT_CONFIGS = {
         "worst_signals":  ["williams_oversold", "bb_squeeze"],
         "ride_stop_mult": 1.3,
         "ext_stop_mult":  2.0,
+        "daily_loss_limit": 0.03,
     },
 }
 
-# V1.6: Bear recipes with confluence min scores and ATR-based exits
 BEAR_RECIPES = {
     "DUST": {
         "underlying":     "GDX",
-        "min_score":      7,       # EV+2.74% at score>=7 / 73 trades
+        "min_score":      7,
         "atr_stop":       0.0180,
         "early_ratchet":  0.0134,
         "trail":          0.0033,
@@ -201,7 +185,7 @@ BEAR_RECIPES = {
     },
     "SOXS": {
         "underlying":     "SMH",
-        "min_score":      9,       # EV+2.66% at score>=9 / 64 trades
+        "min_score":      9,
         "atr_stop":       0.0177,
         "early_ratchet":  0.0120,
         "trail":          0.0032,
@@ -211,7 +195,7 @@ BEAR_RECIPES = {
     },
     "LABD": {
         "underlying":     "XBI",
-        "min_score":      4,       # EV+0.13% at score>=4 / 347 trades
+        "min_score":      4,
         "atr_stop":       0.0164,
         "early_ratchet":  0.0032,
         "trail":          0.0030,
@@ -231,73 +215,62 @@ BEAR_RECIPES = {
     },
 }
 
-# DUST/SOXS extended TP: avg MFE 5.4%/4.8% — use trailing exit not fixed cap
 BEAR_EXTENDED_TP = {
     "DUST": {"trail_activate": 0.020, "trail_stop": 0.010},
     "SOXS": {"trail_activate": 0.020, "trail_stop": 0.010},
 }
 
-# Signal combo boost for entry size scaling
 SIGNAL_COMBO_BOOST_SYMBOLS = {
-    "SOXL": [("bb_squeeze", "stochrsi_oversold")],     # 86% WR
-    "LABU": [("rsi14_lt20", "rsi_lt25")],              # 74% WR
-    "TQQQ": [("bouncing", "obv_falling")],             # 74% WR
-    "NUGT": [("bb_squeeze", "macd_bullish")],          # 68% WR
-    "DUST": [("far_below_bb", "stochrsi_oversold")],   # 71% WR
-    "SOXS": [("below_ma20", "rsi_lt25")],              # 71% WR
-    "LABD": [("ema9_above_ema21", "stochrsi_oversold")], # 67% WR
+    "SOXL": [("bb_squeeze", "stochrsi_oversold")],
+    "LABU": [("rsi14_lt20", "rsi_lt25")],
+    "TQQQ": [("bouncing", "obv_falling")],
+    "NUGT": [("bb_squeeze", "macd_bullish")],
+    "DUST": [("far_below_bb", "stochrsi_oversold")],
+    "SOXS": [("below_ma20", "rsi_lt25")],
+    "LABD": [("ema9_above_ema21", "stochrsi_oversold")],
 }
 
-# VIX regime thresholds
-VIX_CAUTION  = 28.0   # reduce bull sizes 50%
-VIX_PAUSE    = 35.0   # pause bull entries entirely (bear still ok)
-
-# Reversal quality thresholds
-REVERSAL_HIGH_RSI    = 75    # above this = high quality overbought
-REVERSAL_HIGH_DROP   = 0.008 # 0.8% drop = high quality
-REVERSAL_OB_RSI      = 70
-REVERSAL_RSI_RESET   = 60
-REVERSAL_CONFIRM     = 0.005
-REVERSAL_MAX_WATCH   = 1800
-
-# Time-in-dwell: exit flat trades after this many minutes
-DWELL_MINUTES        = 30
-DWELL_FLAT_THRESHOLD = 0.001  # within 0.1% of entry = flat
-
-# RSI overbought exit threshold
-RSI_OVERBOUGHT_EXIT  = 70
-
+# Thresholds
+VIX_CAUTION            = 28.0
+VIX_PAUSE              = 35.0
+REVERSAL_HIGH_RSI      = 75
+REVERSAL_HIGH_DROP     = 0.008
+REVERSAL_OB_RSI        = 70
+REVERSAL_RSI_RESET     = 60
+REVERSAL_CONFIRM       = 0.005
+REVERSAL_MAX_WATCH     = 1800
+DWELL_MINUTES          = 30
+DWELL_FLAT_THRESHOLD   = 0.001
+RSI_OVERBOUGHT_EXIT    = 70
 QQQ_BEAR_RSI_GATE      = 58
 QQQ_BEAR_RSI_GATE_LABD = 65
+PM_MIN_TRADES          = 15
+PM_ANALYSIS_INTERVAL   = 86400
+PM_MIN_BUCKET_TRADES   = 3
+WIN_RATE_GATE_THRESHOLD = 0.45
+BUYING_POWER_BUFFER    = 1.02   # tighter with fractional shares
+WIN_COOLDOWN_SECS      = 180
+LOSS_COOLDOWN_SECS     = 900
+LOOP_INTERVAL          = 12
+WARMUP_BARS            = 60
+BARS_1M                = 60    # 1-minute bars to fetch
+BARS_5M                = 60    # 5-minute bars to fetch
 
-PM_MIN_TRADES        = 15
-PM_ANALYSIS_INTERVAL = 86400
-PM_MIN_BUCKET_TRADES = 3
-WIN_RATE_GATE_THRESHOLD = 0.45  # V1.9: was 0.35 -- 35% WR is net negative EV at current TP/stop ratios
+# V2.0: New intelligence thresholds
+ADX_TREND_THRESHOLD    = 20.0   # ADX < 20 = ranging = SCALP only
+VOL_CONFIRM_MULT       = 1.2    # entry bar volume must be > 1.2x prior 10-bar avg
+UNDERLYING_EXIT_RSI    = 72     # underlying RSI above this = start watching for exit signal
+DAILY_LOSS_LIMIT       = 0.03   # 3% daily loss per bot = pause until next day
 
-BUYING_POWER_BUFFER  = 1.15
-WIN_COOLDOWN_SECS    = 180
-LOSS_COOLDOWN_SECS   = 900
-WEBULL_CACHE_TTL     = 25
-WEBULL_429_BACKOFF   = 30
-LOOP_INTERVAL        = 12
-WARMUP_BARS          = 40
-
-# ── Webull client ─────────────────────────────────────────────────────────────
-api_client   = ApiClient(APP_KEY, APP_SECRET, "us")
-trade_client = TradeClient(api_client)
-_order_lock  = threading.Lock()
-_balance_lock   = threading.Lock()
-_positions_lock = threading.Lock()
-
-# ── Shared context data ───────────────────────────────────────────────────────
-_spy_prices:        list  = []
-_qqq_prices:        list  = []
-_vix_price:         float = 15.0
-_vix_last_updated:  float = 0.0   # V1.9: track when VIX was last fetched
-_underlying_prices: dict  = {}   # {symbol: [prices]}
-_underlying_5m:     dict  = {}   # {symbol: [5-min prices]}
-_context_lock               = threading.Lock()
+# ── Shared price history (updated by context refresh thread) ──────────────────
+# Stores deques of close prices and volumes per symbol
+_price_history: dict  = {sym: deque(maxlen=120) for sym in ALL_SYMBOLS}
+_volume_history: dict = {sym: deque(maxlen=120) for sym in ALL_SYMBOLS}
+_price_5m_history: dict = {sym: deque(maxlen=120) for sym in ALL_SYMBOLS}
+_vol_5m_history: dict   = {sym: deque(maxlen=120) for sym in ALL_SYMBOLS}
+_latest_prices: dict  = {}   # symbol -> float (most recent trade price)
+_vix_smooth: float    = 15.0
+_context_lock         = threading.Lock()
 
 _analyst_scores_cache: dict  = {}
 _analyst_scores_ts:    float = 0.0
@@ -306,15 +279,21 @@ _analyst_lock                = threading.Lock()
 
 _phase4_memory = None
 
+
 # ── Helpers ───────────────────────────────────────────────────────────────────
-def log(symbol, msg):
+def log(symbol: str, msg: str):
     ts = datetime.now(tz=CENTRAL).strftime("%H:%M:%S")
     print(f"[{symbol} | {ts}] {msg}", flush=True)
 
-def alert(msg):
+def alert(msg: str):
+    if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
+        return
     try:
-        url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
-        requests.post(url, data={"chat_id": TELEGRAM_CHAT_ID, "text": msg}, timeout=5)
+        requests.post(
+            f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage",
+            data={"chat_id": TELEGRAM_CHAT_ID, "text": msg},
+            timeout=5
+        )
     except Exception:
         pass
 
@@ -322,25 +301,204 @@ def is_market_hours() -> bool:
     now = datetime.now(tz=CENTRAL)
     return now.weekday() < 5 and 8 <= now.hour < 15
 
+
+# ── Alpaca data layer ─────────────────────────────────────────────────────────
+def _bars_to_lists(bars_dict: dict, sym: str) -> tuple:
+    """Extract (closes, volumes) from Alpaca bars dict for a symbol."""
+    bars = bars_dict.get(sym, [])
+    closes  = [float(b.close)  for b in bars]
+    volumes = [float(b.volume) for b in bars]
+    return closes, volumes
+
+def refresh_all_prices():
+    """
+    V2.0: Batch fetch latest prices and bar history for all 14 symbols
+    in 3 Alpaca API calls instead of per-symbol yfinance calls.
+    Called by the context refresh thread every 10s.
+    """
+    global _vix_smooth
+
+    try:
+        # 1. Latest trade prices (for real-time P&L and current price)
+        latest = stock_data_client.get_stock_latest_trade(
+            StockLatestTradeRequest(
+                symbol_or_symbols=ALL_SYMBOLS,
+                feed=DataFeed.IEX
+            )
+        )
+        with _context_lock:
+            for sym in ALL_SYMBOLS:
+                if sym in latest:
+                    _latest_prices[sym] = float(latest[sym].price)
+
+        # VIX via VIXY: VIXY price * 10 ≈ VIX (same approach as main.py V10.19)
+        if "VIXY" in _latest_prices:
+            vixy = _latest_prices["VIXY"]
+            if vixy > 0:
+                raw_vix = vixy * 10.0
+                with _context_lock:
+                    # 3-reading smooth to avoid single-bar whipsaws
+                    _vix_smooth = (_vix_smooth * 0.7) + (raw_vix * 0.3)
+
+    except Exception as e:
+        print(f"[P4 DATA] latest price fetch error: {e}", flush=True)
+
+    try:
+        # 2. 1-minute bars (last 60 bars per symbol, ~1 hour of history)
+        start_1m = datetime.now(timezone.utc) - timedelta(hours=2)
+        bars_1m  = stock_data_client.get_stock_bars(
+            StockBarsRequest(
+                symbol_or_symbols=ALL_SYMBOLS,
+                timeframe=TimeFrame(1, TimeFrameUnit.Minute),
+                start=start_1m,
+                limit=BARS_1M,
+                feed=DataFeed.IEX,
+            )
+        )
+        with _context_lock:
+            for sym in ALL_SYMBOLS:
+                closes, volumes = _bars_to_lists(bars_1m, sym)
+                if closes:
+                    _price_history[sym]  = deque(closes,  maxlen=120)
+                    _volume_history[sym] = deque(volumes, maxlen=120)
+
+    except Exception as e:
+        print(f"[P4 DATA] 1m bars fetch error: {e}", flush=True)
+
+    try:
+        # 3. 5-minute bars (last 60 bars per symbol, ~5 hours of history)
+        start_5m = datetime.now(timezone.utc) - timedelta(hours=6)
+        bars_5m  = stock_data_client.get_stock_bars(
+            StockBarsRequest(
+                symbol_or_symbols=ALL_SYMBOLS,
+                timeframe=TimeFrame(5, TimeFrameUnit.Minute),
+                start=start_5m,
+                limit=BARS_5M,
+                feed=DataFeed.IEX,
+            )
+        )
+        with _context_lock:
+            for sym in ALL_SYMBOLS:
+                closes, volumes = _bars_to_lists(bars_5m, sym)
+                if closes:
+                    _price_5m_history[sym] = deque(closes,  maxlen=120)
+                    _vol_5m_history[sym]   = deque(volumes, maxlen=120)
+
+    except Exception as e:
+        print(f"[P4 DATA] 5m bars fetch error: {e}", flush=True)
+
+def get_prices(symbol: str) -> tuple:
+    """Return (closes_1m, volumes_1m) for a symbol from shared cache."""
+    with _context_lock:
+        return list(_price_history[symbol]), list(_volume_history[symbol])
+
+def get_prices_5m(symbol: str) -> tuple:
+    """Return (closes_5m, volumes_5m) for a symbol."""
+    with _context_lock:
+        return list(_price_5m_history[symbol]), list(_vol_5m_history[symbol])
+
+def get_current_price(symbol: str) -> float | None:
+    """Get most recent trade price from shared cache."""
+    with _context_lock:
+        p = _latest_prices.get(symbol)
+    return float(p) if p and p > 0 else None
+
+def get_vix() -> float:
+    with _context_lock:
+        return _vix_smooth
+
+def context_refresh_loop():
+    """Background thread: refresh all price data every 10 seconds."""
+    print("[P4 DATA] Context refresh thread started", flush=True)
+    while True:
+        try:
+            refresh_all_prices()
+        except Exception as e:
+            print(f"[P4 DATA] refresh error: {e}", flush=True)
+        time.sleep(10)
+
+
+# ── Alpaca broker layer ───────────────────────────────────────────────────────
+def get_buying_power() -> float:
+    """Real-time buying power from Alpaca account."""
+    try:
+        acct = trading_client.get_account()
+        return float(acct.buying_power)
+    except Exception as e:
+        print(f"[P4 BROKER] buying_power error: {e}", flush=True)
+        return 0.0
+
+def get_all_positions() -> dict:
+    """Returns {symbol: position_obj} for all open Alpaca positions."""
+    try:
+        raw = trading_client.get_all_positions()
+        return {p.symbol: p for p in raw}
+    except Exception as e:
+        print(f"[P4 BROKER] get_positions error: {e}", flush=True)
+        return {}
+
+def place_order(symbol: str, side: str, notional: float) -> bool:
+    """
+    V2.0: Place a fractional market order via Alpaca using notional (dollar amount).
+    Fractional shares = 100% capital deployment, no whole-share rounding waste.
+    """
+    with _order_lock:
+        try:
+            order_side = OrderSide.BUY if side == "BUY" else OrderSide.SELL
+            # For sells: use qty from position rather than notional
+            # (sell notional can undershoot if price moved since entry)
+            if side == "SELL":
+                positions = get_all_positions()
+                if symbol not in positions:
+                    return False
+                qty = float(positions[symbol].qty)
+                if qty <= 0:
+                    return False
+                req = MarketOrderRequest(
+                    symbol=symbol,
+                    qty=qty,
+                    side=OrderSide.SELL,
+                    time_in_force=TimeInForce.DAY,
+                )
+            else:
+                if notional < 1.0:
+                    return False
+                req = MarketOrderRequest(
+                    symbol=symbol,
+                    notional=round(notional, 2),
+                    side=OrderSide.BUY,
+                    time_in_force=TimeInForce.DAY,
+                )
+            trading_client.submit_order(req)
+            return True
+        except Exception as e:
+            print(f"[P4 BROKER] order error [{symbol} {side}]: {e}", flush=True)
+            return False
+
+def close_position_market(symbol: str) -> bool:
+    """Force-close a position at market."""
+    try:
+        trading_client.close_position(symbol)
+        return True
+    except Exception as e:
+        print(f"[P4 BROKER] close_position error [{symbol}]: {e}", flush=True)
+        return False
+
+
 # ── Signal computations ───────────────────────────────────────────────────────
 def compute_rsi(prices: list, period: int = 7) -> float | None:
     if len(prices) < period + 1:
         return None
-    s     = pd.Series(prices, dtype=float)
-    delta = s.diff()
-    gain  = delta.where(delta > 0, 0.0)
-    loss  = (-delta.where(delta < 0, 0.0))
-    # V1.7: Wilder smoothed RSI (EWM alpha=1/period) -- replaces simple
-    # rolling mean which was noisier and triggered more false signals.
-    # Matches main.py V10.8 and industry standard Wilder RSI.
+    s        = pd.Series(prices, dtype=float)
+    delta    = s.diff()
+    gain     = delta.where(delta > 0, 0.0)
+    loss     = (-delta.where(delta < 0, 0.0))
     avg_gain = gain.ewm(alpha=1.0 / period, adjust=False).mean()
     avg_loss = loss.ewm(alpha=1.0 / period, adjust=False).mean()
     rs  = avg_gain / avg_loss.replace(0, float("nan"))
     rsi = 100 - (100 / (1 + rs))
     val = float(rsi.iloc[-1])
-    if not (0 < val < 100):
-        return None
-    return round(val, 2)
+    return round(val, 2) if 0 < val < 100 else None
 
 def compute_ma(prices: list, period: int = 20) -> float | None:
     if len(prices) < period:
@@ -354,7 +512,6 @@ def compute_ema(prices: list, period: int) -> float | None:
     return round(float(s.ewm(span=period, adjust=False).mean().iloc[-1]), 4)
 
 def compute_atr(prices: list, period: int = 14) -> float:
-    """Average True Range from close prices (simplified — no high/low available)."""
     if len(prices) < period + 1:
         return abs(prices[-1] * 0.015) if prices else 0.0
     diffs = [abs(prices[i] - prices[i-1]) for i in range(1, len(prices))]
@@ -374,6 +531,7 @@ def compute_macd(prices: list) -> dict:
         "macd_line":   round(float(macd_line.iloc[-1]), 5),
         "signal_line": round(float(signal.iloc[-1]), 5),
         "histogram":   round(float(hist.iloc[-1]), 5),
+        "hist_prev":   round(float(hist.iloc[-2]), 5) if len(hist) >= 2 else 0,
     }
 
 def compute_bollinger(prices: list, period: int = 20, std_dev: float = 2.0) -> dict:
@@ -388,28 +546,21 @@ def compute_bollinger(prices: list, period: int = 20, std_dev: float = 2.0) -> d
     price  = prices[-1]
     band_w = upper - lower
     pct_b  = (price - lower) / band_w if band_w > 0 else 0.5
-    squeeze    = (band_w / price) < 0.02 if price > 0 else False
+    squeeze = (band_w / price) < 0.02 if price > 0 else False
     return {
-        "upper":      round(upper, 4),
-        "middle":     round(middle, 4),
-        "lower":      round(lower, 4),
-        "pct_b":      round(pct_b, 3),
-        "squeeze":    squeeze,
-        "near_lower": pct_b < 0.20,
-        "at_lower":   pct_b < 0.05,
+        "upper": round(upper, 4), "middle": round(middle, 4), "lower": round(lower, 4),
+        "pct_b": round(pct_b, 3), "squeeze": squeeze,
+        "near_lower": pct_b < 0.20, "at_lower": pct_b < 0.05,
         "far_below":  price < lower * 0.99,
     }
 
 def compute_stochrsi(prices: list, rsi_period: int = 14, stoch_period: int = 14) -> dict:
     if len(prices) < rsi_period + stoch_period + 5:
         return {"k": 50, "d": 50, "oversold": False, "overbought": False}
-    s     = pd.Series(prices, dtype=float)
-    delta = s.diff()
-    gain  = delta.where(delta > 0, 0.0)
-    loss  = (-delta.where(delta < 0, 0.0))
-    # V1.8: Wilder EWM smoothing inside StochRSI -- matches compute_rsi()
-    # The old simple rolling mean understated oversold readings, causing some
-    # genuine oversold setups to miss the stochrsi_oversold signal flag.
+    s        = pd.Series(prices, dtype=float)
+    delta    = s.diff()
+    gain     = delta.where(delta > 0, 0.0)
+    loss     = (-delta.where(delta < 0, 0.0))
     avg_gain = gain.ewm(alpha=1.0 / rsi_period, adjust=False).mean()
     avg_loss = loss.ewm(alpha=1.0 / rsi_period, adjust=False).mean()
     rs       = avg_gain / avg_loss.replace(0, float("nan"))
@@ -421,11 +572,8 @@ def compute_stochrsi(prices: list, rsi_period: int = 14, stoch_period: int = 14)
     stoch_d  = stoch_k.rolling(3).mean()
     k_val    = float(stoch_k.iloc[-1])
     d_val    = float(stoch_d.iloc[-1])
-    return {
-        "k": round(k_val, 2), "d": round(d_val, 2),
-        "oversold":   k_val < 20 and d_val < 20,
-        "overbought": k_val > 80 and d_val > 80,
-    }
+    return {"k": round(k_val, 2), "d": round(d_val, 2),
+            "oversold": k_val < 20 and d_val < 20, "overbought": k_val > 80 and d_val > 80}
 
 def compute_obv(prices: list, volumes: list) -> dict:
     if len(prices) < 10 or len(volumes) < 10:
@@ -451,10 +599,10 @@ def compute_williams_r(prices: list, period: int = 14) -> dict:
 def compute_cci(prices: list, period: int = 20) -> dict:
     if len(prices) < period:
         return {"value": 0, "oversold": False}
-    recent   = prices[-period:]
-    tp_mean  = sum(recent) / len(recent)
+    recent  = prices[-period:]
+    tp_mean = sum(recent) / len(recent)
     mean_dev = sum(abs(p - tp_mean) for p in recent) / len(recent)
-    cci_val  = (recent[-1] - tp_mean) / (0.015 * mean_dev) if mean_dev > 0 else 0
+    cci_val = (recent[-1] - tp_mean) / (0.015 * mean_dev) if mean_dev > 0 else 0
     return {"value": round(cci_val, 2), "oversold": cci_val < -100}
 
 def check_higher_lows(prices: list, lookback: int = 20) -> bool:
@@ -465,178 +613,74 @@ def check_higher_lows(prices: list, lookback: int = 20) -> bool:
               if recent[i] <= recent[i-1] and recent[i] <= recent[i+1]]
     return len(lows) >= 2 and lows[-1] > lows[-2]
 
-def fetch_prices_and_volumes(symbol: str, bars: int = 40, interval: str = "1m") -> tuple:
+def compute_adx(prices: list, period: int = 14) -> float:
+    """
+    V2.0: Average Directional Index from close prices (simplified).
+    Uses Wilder smoothing. Returns ADX value 0-100.
+    ADX < 20 = ranging/choppy market (SCALP only).
+    ADX > 25 = trending market (RIDE/EXTENDED allowed).
+    Computed from close prices only (no high/low available from IEX bars).
+    """
+    if len(prices) < period * 2 + 5:
+        return 25.0  # default to trend-present if insufficient data
     try:
-        ticker = yf.Ticker(symbol)
-        period = "1d" if interval == "1m" else "5d"
-        df     = ticker.history(period=period, interval=interval)
-        if not df.empty:
-            return df["Close"].tail(bars).tolist(), df["Volume"].tail(bars).tolist()
+        s     = pd.Series(prices)
+        # Use price momentum as DM proxy (close-based simplified ADX)
+        pos_dm = s.diff().clip(lower=0)
+        neg_dm = (-s.diff()).clip(lower=0)
+        tr     = s.diff().abs()   # simplified TR from closes
+
+        # Wilder smoothing
+        atr_s  = tr.ewm(alpha=1.0 / period, adjust=False).mean()
+        pdm_s  = pos_dm.ewm(alpha=1.0 / period, adjust=False).mean()
+        ndm_s  = neg_dm.ewm(alpha=1.0 / period, adjust=False).mean()
+
+        pdi = 100 * pdm_s / atr_s.replace(0, float("nan"))
+        ndi = 100 * ndm_s / atr_s.replace(0, float("nan"))
+        dx  = 100 * (pdi - ndi).abs() / (pdi + ndi).replace(0, float("nan"))
+        adx = dx.ewm(alpha=1.0 / period, adjust=False).mean()
+        val = float(adx.iloc[-1])
+        return round(val, 2) if not (pd.isna(val) or val < 0) else 25.0
     except Exception:
-        pass
-    return [], []
+        return 25.0
 
-def fetch_prices(symbol: str, bars: int = 40) -> list:
-    p, _ = fetch_prices_and_volumes(symbol, bars)
-    return p
+def check_volume_confirmation(prices: list, volumes: list, lookback: int = 10) -> bool:
+    """
+    V2.0: Entry bar volume confirmation gate.
+    The most recent bar's volume must be > VOL_CONFIRM_MULT x avg of prior bars.
+    Reversal candles on below-average volume are traps.
+    Returns True if volume confirms, True if insufficient data (don't block on missing data).
+    """
+    if len(volumes) < lookback + 1:
+        return True   # not enough data = don't block
+    recent_vol = volumes[-1]
+    avg_vol    = sum(volumes[-lookback-1:-1]) / lookback
+    if avg_vol <= 0:
+        return True
+    return recent_vol >= avg_vol * VOL_CONFIRM_MULT
 
-def get_current_price(symbol: str) -> float | None:
-    try:
-        return float(yf.Ticker(symbol).fast_info.last_price)
-    except Exception:
-        return None
 
-def get_account_id() -> str:
-    if ACCOUNT_ID:
-        return ACCOUNT_ID
-    try:
-        res = trade_client.account_v2.get_account_list()
-        if res.status_code == 200:
-            accounts = res.json()
-            if accounts:
-                return accounts[0].get("account_id", "")
-    except Exception:
-        pass
-    return ""
-
-_balance_cache      = {}
-_balance_cache_time = 0.0
-
-def get_buying_power(acct_id: str) -> float:
-    global _balance_cache, _balance_cache_time
-    now = time.time()
-    with _balance_lock:
-        if now - _balance_cache_time < WEBULL_CACHE_TTL and _balance_cache:
-            bp = float(_balance_cache.get("buying_power", 0))
-            return bp or float(_balance_cache.get("option_buying_power", 0))
-    try:
-        res = trade_client.account_v2.get_account_balance(acct_id)
-        if res.status_code == 200:
-            for asset in res.json().get("account_currency_assets", []):
-                if asset.get("currency") == "USD":
-                    with _balance_lock:
-                        _balance_cache      = asset
-                        _balance_cache_time = now
-                    bp = float(asset.get("buying_power", 0))
-                    return bp or float(asset.get("option_buying_power", 0))
-        elif res.status_code == 429:
-            time.sleep(WEBULL_429_BACKOFF)
-    except Exception:
-        pass
-    with _balance_lock:
-        bp = float(_balance_cache.get("buying_power", 0))
-        return bp or float(_balance_cache.get("option_buying_power", 0))
-
-_positions_cache      = {}
-_positions_cache_time = 0.0
-
-def get_all_positions(acct_id: str) -> dict:
-    global _positions_cache, _positions_cache_time
-    now = time.time()
-    with _positions_lock:
-        if now - _positions_cache_time < WEBULL_CACHE_TTL and _positions_cache is not None:
-            return dict(_positions_cache)
-    try:
-        res = trade_client.account_v2.get_account_position(acct_id)
-        if res.status_code == 200:
-            data  = res.json()
-            items = data if isinstance(data, list) else data.get("items", [])
-            result = {}
-            for item in items:
-                sym = item.get("ticker", {}).get("symbol", "") or item.get("symbol", "")
-                if sym:
-                    result[sym] = item
-            with _positions_lock:
-                _positions_cache      = result
-                _positions_cache_time = now
-            return result
-        elif res.status_code == 429:
-            time.sleep(WEBULL_429_BACKOFF)
-    except Exception:
-        pass
-    with _positions_lock:
-        return dict(_positions_cache) if _positions_cache else {}
-
-def invalidate_pos_cache():
-    global _positions_cache_time
-    with _positions_lock:
-        _positions_cache_time = 0.0
-
-def place_order(symbol: str, side: str, qty: int, acct_id: str) -> bool:
-    with _order_lock:
-        try:
-            order = {
-                "client_order_id":         uuid.uuid4().hex,
-                "combo_type":              "NORMAL",
-                "symbol":                  symbol,
-                "instrument_type":         "EQUITY",
-                "market":                  "US",
-                "side":                    side,
-                "order_type":              "MARKET",
-                "time_in_force":           "DAY",
-                "quantity":                str(qty),
-                "support_trading_session": "CORE",
-                "entrust_type":            "QTY",
-            }
-            res = trade_client.order_v2.place_order(account_id=acct_id, new_orders=[order])
-            if res.status_code == 200:
-                return True
-            print(f"[ORDER ERR] {symbol} {side}: {res.status_code} {res.text[:200]}", flush=True)
-            return False
-        except Exception as e:
-            print(f"[ORDER ERR] {symbol} {side}: {e}", flush=True)
-            return False
-
-# ── Context refresh thread ────────────────────────────────────────────────────
-def refresh_context_data():
-    """Fetch SPY, QQQ, VIX, and all underlying indices every 30s."""
-    all_underlyings = ["SMH", "GDX", "XBI", "QQQ", "^VIX"]
-    while True:
-        try:
-            spy_p, _ = fetch_prices_and_volumes("SPY", 40)
-            qqq_p, _ = fetch_prices_and_volumes("QQQ", 40)
-            with _context_lock:
-                if spy_p: _spy_prices[:] = spy_p
-                if qqq_p: _qqq_prices[:] = qqq_p
-
-            for sym in all_underlyings:
-                p1, _ = fetch_prices_and_volumes(sym, 40, "1m")
-                p5, _ = fetch_prices_and_volumes(sym, 60, "5m")
-                vix_sym = sym.replace("^", "")
-                with _context_lock:
-                    if p1:
-                        if sym == "^VIX":
-                            globals()["_vix_price"] = p1[-1]
-                            globals()["_vix_last_updated"] = time.time()  # V1.9
-                        else:
-                            _underlying_prices[sym] = p1
-                    if p5:
-                        _underlying_5m[sym] = p5
-        except Exception:
-            pass
-        time.sleep(30)
-
+# ── Context functions ─────────────────────────────────────────────────────────
 def get_spy_context() -> dict:
-    with _context_lock:
-        prices = list(_spy_prices)
+    prices, _ = get_prices("SPY")
     if len(prices) < 21:
         return {"bullish": False, "strong": False, "overbought": False,
                 "momentum": 0, "rsi": 50, "above_ma20": False}
-    rsi        = compute_rsi(prices) or 50
-    ma20       = compute_ma(prices, 20) or prices[-1]
-    momentum   = (prices[-1] - prices[-6]) / prices[-6] if prices[-6] > 0 else 0
+    rsi       = compute_rsi(prices) or 50
+    ma20      = compute_ma(prices, 20) or prices[-1]
+    momentum  = (prices[-1] - prices[-6]) / prices[-6] if len(prices) >= 6 and prices[-6] > 0 else 0
     above_ma20 = prices[-1] > ma20
-    bullish    = above_ma20 and momentum > 0
-    strong     = above_ma20 and momentum > 0.005
     return {
-        "bullish": bullish, "strong": strong,
-        "overbought": rsi > 72, "momentum": round(momentum * 100, 3),
-        "rsi": rsi, "above_ma20": above_ma20,
+        "bullish":    above_ma20 and momentum > 0,
+        "strong":     above_ma20 and momentum > 0.005,
+        "overbought": rsi > 72,
+        "momentum":   round(momentum * 100, 3),
+        "rsi":        rsi,
+        "above_ma20": above_ma20,
     }
 
 def get_qqq_context() -> dict:
-    with _context_lock:
-        prices = list(_qqq_prices)
+    prices, _ = get_prices("QQQ")
     if len(prices) < 8:
         return {"rsi": 50, "momentum": 0, "overbought": False, "oversold": False}
     rsi      = compute_rsi(prices) or 50
@@ -646,26 +690,9 @@ def get_qqq_context() -> dict:
         "overbought": rsi > 68, "oversold": rsi < 35,
     }
 
-def get_vix() -> float:
-    with _context_lock:
-        vix   = _vix_price
-        last  = _vix_last_updated
-    # V1.9: Warn when VIX data is stale (>5 min) -- stale VIX silently disables
-    # the >28 caution and >35 pause regime gates, which is a silent risk.
-    if last > 0 and (time.time() - last) > 300:
-        print(f"[VIX] ⚠️ VIX data stale ({int((time.time()-last)/60)}m) -- "
-              f"using last known value {vix:.1f}", flush=True)
-    return vix
-
 def get_underlying_context(underlying: str) -> dict:
-    """
-    V1.6: Macro tide layer — underlying index context.
-    SMH for SOXL/SOXS, GDX for NUGT/DUST, XBI for LABU/LABD, QQQ for TQQQ/SQQQ.
-    Returns both 1-min and 5-min context.
-    """
-    with _context_lock:
-        prices_1m = list(_underlying_prices.get(underlying, []))
-        prices_5m = list(_underlying_5m.get(underlying, []))
+    prices_1m, vols_1m = get_prices(underlying)
+    prices_5m, _       = get_prices_5m(underlying)
 
     result = {
         "available":       False,
@@ -679,17 +706,21 @@ def get_underlying_context(underlying: str) -> dict:
         "vol_expanding":   False,
         "tide_bullish":    False,
         "tide_bearish":    False,
+        # V2.0: exit signal context
+        "reversal_warning": False,
     }
 
     if len(prices_1m) >= 21:
-        rsi_1m       = compute_rsi(prices_1m) or 50
-        ema20_1m     = compute_ema(prices_1m, 20) or prices_1m[-1]
-        momentum_1m  = (prices_1m[-1] - prices_1m[-6]) / prices_1m[-6] if len(prices_1m) >= 6 and prices_1m[-6] > 0 else 0
+        rsi_1m      = compute_rsi(prices_1m) or 50
+        ema20_1m    = compute_ema(prices_1m, 20) or prices_1m[-1]
+        momentum_1m = (prices_1m[-1] - prices_1m[-6]) / prices_1m[-6] if len(prices_1m) >= 6 and prices_1m[-6] > 0 else 0
+        macd_1m     = compute_macd(prices_1m)
         result.update({
             "available":      True,
             "rsi_1m":         rsi_1m,
             "above_ema20_1m": prices_1m[-1] > ema20_1m,
             "trending_up_1m": momentum_1m > 0,
+            "macd_bullish_1m": macd_1m["bullish"],
         })
 
     if len(prices_5m) >= 21:
@@ -697,20 +728,23 @@ def get_underlying_context(underlying: str) -> dict:
         ema20_5m    = compute_ema(prices_5m, 20) or prices_5m[-1]
         momentum_5m = (prices_5m[-1] - prices_5m[-6]) / prices_5m[-6] if len(prices_5m) >= 6 and prices_5m[-6] > 0 else 0
         hl_5m       = check_higher_lows(prices_5m, 15)
+        macd_5m     = compute_macd(prices_5m)
         result.update({
             "rsi_5m":         rsi_5m,
             "above_ema20_5m": prices_5m[-1] > ema20_5m,
             "trending_up_5m": momentum_5m > 0 and hl_5m,
         })
-
-        # Bear trap detection: underlying at multi-day high + expanding volume
-        # Use 5-min prices to check if at 30-bar high
         if len(prices_5m) >= 30:
             recent_high = max(prices_5m[-30:])
-            at_high     = prices_5m[-1] >= recent_high * 0.995
-            result["at_high"] = at_high
+            result["at_high"] = prices_5m[-1] >= recent_high * 0.995
 
-    # Tide determination
+        # V2.0: Underlying reversal warning
+        # If underlying RSI was overbought and MACD is now turning bearish → exit soon
+        if rsi_5m >= UNDERLYING_EXIT_RSI and not macd_5m["bullish"]:
+            result["reversal_warning"] = True
+        elif rsi_5m >= UNDERLYING_EXIT_RSI and macd_5m["histogram"] < macd_5m.get("hist_prev", 0):
+            result["reversal_warning"] = True  # histogram decelerating at highs
+
     if result["available"]:
         result["tide_bullish"] = (
             result["above_ema20_1m"] and
@@ -723,6 +757,7 @@ def get_underlying_context(underlying: str) -> dict:
         )
 
     return result
+
 
 # ── Analyst bridge ────────────────────────────────────────────────────────────
 def fetch_analyst_scores() -> dict:
@@ -762,15 +797,16 @@ def get_analyst_signal_boost(symbol: str, analyst_scores: dict) -> tuple:
             return 1, signals
     return 0, signals
 
-# ── Phase4Memory ─────────────────────────────────────────────────────────────
+
+# ── Phase4Memory (unchanged from V1.x) ───────────────────────────────────────
 class Phase4Memory:
     def __init__(self, db_url: str):
-        self.db_url       = db_url
-        self._conn        = None
-        self._lock        = threading.Lock()
-        self._win_rates   = {}
+        self.db_url         = db_url
+        self._conn          = None
+        self._lock          = threading.Lock()
+        self._win_rates     = {}
         self._last_analysis = 0.0
-        self._enabled     = bool(db_url) and _db_available
+        self._enabled       = bool(db_url) and _db_available
 
     def _get_conn(self):
         if not self._enabled:
@@ -837,7 +873,6 @@ class Phase4Memory:
             last_updated TIMESTAMPTZ DEFAULT NOW()
         );
         """
-        # Also add new V1.6 columns to existing table if they don't exist
         alter_ddl = """
         ALTER TABLE phase4_trade_fingerprints
             ADD COLUMN IF NOT EXISTS entry_score      INTEGER,
@@ -853,7 +888,7 @@ class Phase4Memory:
                         cur.execute(ddl)
                         cur.execute(alter_ddl)
                     conn.commit()
-                    print("[PM] Phase4 pattern memory tables ready (V1.6)", flush=True)
+                    print("[PM] Phase4 pattern memory tables ready (V2.0)", flush=True)
         except Exception as e:
             print(f"[PM] init_tables error: {e}", flush=True)
 
@@ -897,16 +932,17 @@ class Phase4Memory:
                                 %s,%s, %s,%s,%s,%s, %s,%s, %s,%s, %s,%s,%s,%s)
                         ON CONFLICT (trade_id) DO NOTHING
                     """, (
-                        trade_id, symbol, bear_pair, is_bear, mode,
+                        trade_id, symbol, bear_pair, bool(is_bear), mode,
                         int(time.time()), entry_price,
                         sym_rsi, spy_ctx.get("rsi"), qqq_ctx.get("rsi"),
-                        spy_ctx.get("bullish"), spy_ctx.get("momentum"), qqq_ctx.get("overbought"),
-                        sym_ctx.get("higher_lows"), sym_ctx.get("above_ma20"),
-                        sym_ctx.get("bb_squeeze"), sym_ctx.get("stochrsi_oversold"),
-                        sym_ctx.get("macd_bullish"), sym_ctx.get("obv_rising"),
+                        bool(spy_ctx.get("bullish")), spy_ctx.get("momentum"),
+                        bool(qqq_ctx.get("overbought")),
+                        bool(sym_ctx.get("higher_lows")), bool(sym_ctx.get("above_ma20")),
+                        bool(sym_ctx.get("bb_squeeze")), bool(sym_ctx.get("stochrsi_oversold")),
+                        bool(sym_ctx.get("macd_bullish")), bool(sym_ctx.get("obv_rising")),
                         now.hour, now.weekday(),
                         analyst_score, signal_boost,
-                        entry_score, reversal_quality, underlying_tide, vix,
+                        entry_score, reversal_quality, bool(underlying_tide), float(vix),
                     ))
                 conn.commit()
         except Exception as e:
@@ -932,7 +968,7 @@ class Phase4Memory:
                         SET won=%s, pnl_pct=%s, exit_reason=%s,
                             hold_time_min=%s, exit_ts=%s, mfe=%s, mae=%s
                         WHERE trade_id=%s
-                    """, (won, round(pnl_pct * 100, 3), exit_reason,
+                    """, (bool(won), round(pnl_pct * 100, 3), exit_reason,
                           hold_min, int(time.time()),
                           round(mfe * 100, 3), round(mae * 100, 3), trade_id))
                 conn.commit()
@@ -990,11 +1026,14 @@ class Phase4Memory:
                         avg_pnl = (sum(pnl_bkts[key]) / len(pnl_bkts[key])
                                    if pnl_bkts[key] else None)
                         cur.execute("""
-                            INSERT INTO phase4_pattern_stats (bucket_key, win_rate, sample_count, avg_pnl)
-                            VALUES (%s, %s, %s, %s)
+                            INSERT INTO phase4_pattern_stats
+                            (bucket_key, win_rate, sample_count, avg_pnl)
+                            VALUES (%s,%s,%s,%s)
                             ON CONFLICT (bucket_key) DO UPDATE
-                            SET win_rate=EXCLUDED.win_rate, sample_count=EXCLUDED.sample_count,
-                                avg_pnl=EXCLUDED.avg_pnl, last_updated=NOW()
+                            SET win_rate=EXCLUDED.win_rate,
+                                sample_count=EXCLUDED.sample_count,
+                                avg_pnl=EXCLUDED.avg_pnl,
+                                last_updated=NOW()
                         """, (key, wr, len(outcomes), avg_pnl))
                         new_cache[key] = wr
                 conn.commit()
@@ -1003,27 +1042,30 @@ class Phase4Memory:
             self._last_analysis = time.time()
             total = len(rows)
             wr    = sum(1 for r in rows if r["won"]) / total if total > 0 else 0
-            print(f"[PM] Analysis: {len(new_cache)} buckets | {total} trades | {wr:.1%} WR", flush=True)
+            print(f"[PM] Analysis: {len(new_cache)} buckets | {total} trades | {wr:.1%} WR",
+                  flush=True)
         except Exception as e:
             print(f"[PM] analysis error: {e}", flush=True)
 
     @staticmethod
-    def _bucket_key(symbol, is_bear, mode, sym_rsi, spy_ctx, qqq_ctx, hour):
-        rsi_b  = ("rsi_lt30" if sym_rsi < 30 else "rsi_30_40" if sym_rsi < 40 else
-                  "rsi_40_55" if sym_rsi < 55 else "rsi_gt55")
+    def _bucket_key(symbol, is_bear, mode, rsi, spy_ctx, qqq_ctx, hour) -> str:
+        rsi_b  = "rsi_hi" if rsi > 70 else "rsi_mid" if rsi > 40 else "rsi_low"
         spy_b  = "spy_bull" if spy_ctx.get("bullish") else "spy_bear"
         qqq_b  = "qqq_ob" if qqq_ctx.get("overbought") else "qqq_ok"
-        bear_b = "bear" if is_bear else "bull"
-        mode_b = mode or "SCALP"
         hr_b   = "hr_open" if hour < 10 else "hr_mid" if hour < 13 else "hr_late"
-        return f"{symbol}|{bear_b}|{mode_b}|{rsi_b}|{spy_b}|{qqq_b}|{hr_b}"
+        bear_b = "bear" if is_bear else "bull"
+        return f"{symbol}|{bear_b}|{mode}|{rsi_b}|{spy_b}|{qqq_b}|{hr_b}"
 
-    def should_skip_entry(self, symbol, is_bear, mode, sym_rsi, spy_ctx, qqq_ctx, hour):
-        key = self._bucket_key(symbol, is_bear, mode, sym_rsi, spy_ctx, qqq_ctx, hour)
+    def should_skip_entry(self, symbol, is_bear, mode, rsi, spy_ctx, qqq_ctx, hour):
+        key = self._bucket_key(symbol, is_bear, mode, rsi, spy_ctx, qqq_ctx, hour)
         if key not in self._win_rates:
             return False, 0.5, False
         wr = self._win_rates[key]
         return (wr < WIN_RATE_GATE_THRESHOLD), wr, True
+
+    def get_win_rate(self, symbol, is_bear, mode, rsi, spy_ctx, qqq_ctx, hour):
+        key = self._bucket_key(symbol, is_bear, mode, rsi, spy_ctx, qqq_ctx, hour)
+        return self._win_rates.get(key, 0.5)
 
     def start_scheduler(self):
         def _run():
@@ -1037,20 +1079,16 @@ class Phase4Memory:
 
 # ── SymbolBot ─────────────────────────────────────────────────────────────────
 class SymbolBot:
-    def __init__(self, symbol: str, config: dict, acct_id: str):
+    def __init__(self, symbol: str, config: dict):
         self.symbol      = symbol
         self.bear_pair   = config["bear_pair"]
         self.underlying  = config["underlying"]
         self.budget_pct  = config["budget_pct"]
         self.cfg         = config
-        self.acct_id     = acct_id
 
-        self.prices:       list  = []
-        self.volumes:      list  = []
-        self.bear_prices:  list  = []
-        self.bear_volumes: list  = []
         self.peak_price:   float = 0.0
         self.entry_price:  float = 0.0
+        self.entry_notional: float = 0.0   # V2.0: track notional spent for P&L
         self.entry_time:   float = 0.0
         self.trade_id:     str   = ""
         self.mfe:          float = 0.0
@@ -1060,13 +1098,10 @@ class SymbolBot:
         self.mode:         str   = "SCALP"
         self.cooldown_until: float = 0.0
 
-        # Extended TP state (DUST/SOXS)
         self._bear_ext_trailing: bool  = False
         self._bear_ext_peak:     float = 0.0
-        # Adaptive ratchet state
         self._late_ratchet_active: bool = False
 
-        # Entry context for fingerprint
         self._entry_spy_ctx:       dict  = {}
         self._entry_qqq_ctx:       dict  = {}
         self._entry_sym_ctx:       dict  = {}
@@ -1082,6 +1117,7 @@ class SymbolBot:
         self.daily_wins:   int   = 0
         self.daily_losses: int   = 0
         self.daily_pnl:    float = 0.0
+        self._daily_limit_hit: bool = False
 
     def is_on_cooldown(self) -> bool:
         return time.time() < self.cooldown_until
@@ -1089,18 +1125,21 @@ class SymbolBot:
     def set_cooldown(self, secs: int):
         self.cooldown_until = time.time() + secs
 
-    def refresh_prices(self):
-        p, v = fetch_prices_and_volumes(self.symbol, WARMUP_BARS + 5)
-        if p:
-            self.prices  = p
-            self.volumes = v
-        bp, bv = fetch_prices_and_volumes(self.bear_pair, WARMUP_BARS + 5)
-        if bp:
-            self.bear_prices  = bp
-            self.bear_volumes = bv
+    def check_daily_loss_limit(self) -> bool:
+        """V2.0: Returns True if bot has hit its daily loss limit."""
+        limit = self.cfg.get("daily_loss_limit", DAILY_LOSS_LIMIT)
+        if self.daily_pnl <= -limit and not self._daily_limit_hit:
+            self._daily_limit_hit = True
+            log(self.symbol,
+                f"🚨 DAILY LOSS LIMIT: {self.daily_pnl*100:.1f}% — pausing until tomorrow")
+            alert(
+                f"🚨 PHASE4 [{self.symbol}] DAILY LIMIT\n"
+                f"Loss: {self.daily_pnl*100:.1f}% | Limit: {limit*100:.0f}%\n"
+                f"Bot paused until market open tomorrow"
+            )
+        return self._daily_limit_hit
 
     def get_signal_suite(self, prices: list, volumes: list) -> dict:
-        """Full 15-signal suite from 1-min bars."""
         if len(prices) < 21:
             return {
                 "rsi": 50, "rsi14": 50, "rsi21": 50,
@@ -1117,6 +1156,8 @@ class SymbolBot:
                 "rsi_lt40": False, "rsi_lt25": False,
                 "rsi14_lt35": False, "rsi14_lt20": False,
                 "rsi21_lt45": False,
+                "vol_confirmed": True,
+                "adx": 25.0,
             }
         rsi7   = compute_rsi(prices, 7)  or 50
         rsi14  = compute_rsi(prices, 14) or 50
@@ -1137,6 +1178,10 @@ class SymbolBot:
         williams = compute_williams_r(prices)
         cci      = compute_cci(prices)
 
+        # V2.0: ADX and volume confirmation
+        adx           = compute_adx(prices)
+        vol_confirmed = check_volume_confirmation(prices, volumes) if volumes else True
+
         return {
             "rsi": rsi7, "rsi14": rsi14, "rsi21": rsi21,
             "ma20": ma20, "above_ma20": above_ma20, "below_ma20": not above_ma20,
@@ -1154,50 +1199,39 @@ class SymbolBot:
             "obv_falling": not obv.get("rising", True),
             "williams_r": williams, "williams_oversold": williams.get("oversold", False),
             "cci": cci,           "cci_oversold":       cci.get("oversold", False),
-            # Named boolean flags matching BOT_CONFIGS best/worst signal keys
             "rsi_lt40":    rsi7  < 40,
             "rsi_lt25":    rsi7  < 25,
             "rsi14_lt35":  rsi14 < 35,
             "rsi14_lt20":  rsi14 < 20,
             "rsi21_lt45":  rsi21 < 45,
+            # V2.0 additions
+            "vol_confirmed": vol_confirmed,
+            "adx":           adx,
         }
 
     def compute_entry_score(self, sym: str, sym_ctx: dict) -> int:
-        """
-        V1.8: Per-symbol confluence score replacing the RSI-only gate.
-        +1 for each best_signal present, -1 for each worst_signal present.
-        Score must reach cfg['min_score'] to enter.
-
-        V1.8 FIX: Neutral signals (not in best, not in worst) NO LONGER add
-        +1. Previously every positive indicator that wasn't explicitly banned
-        scored +1, allowing irrelevant noise signals to pad the score past
-        min_score. Now only explicit best_signals score positive, so the
-        min_score thresholds derived from backtest data are respected.
-        """
-        cfg  = self.cfg if sym == self.symbol else BEAR_RECIPES.get(sym, self.cfg)
-        best = cfg.get("best_signals", [])
+        cfg   = self.cfg if sym == self.symbol else BEAR_RECIPES.get(sym, self.cfg)
+        best  = cfg.get("best_signals", [])
         worst = cfg.get("worst_signals", [])
         score = 0
-
-        # Only best_signals score positive -- neutral signals contribute nothing
         for sig in best:
             if sym_ctx.get(sig, False):
                 score += 1
-
-        # Worst signals subtract
         for sig in worst:
             if sym_ctx.get(sig, False):
                 score -= 1
-
-        # Bonus for extreme conditions when they are best signals
         if sym_ctx.get("rsi_lt25") and "rsi_lt25" in best:
-            score += 1  # extra point for extreme oversold when it's a best signal
+            score += 1
         if sym_ctx.get("at_lower_bb") and "at_lower_bb" in best:
             score += 1
-
         return max(0, score)
 
     def select_mode(self, spy_ctx: dict, sym_ctx: dict) -> str:
+        # V2.0: ADX regime filter — ranging market forces SCALP mode
+        adx = sym_ctx.get("adx", 25.0)
+        if adx < ADX_TREND_THRESHOLD:
+            return "SCALP"
+
         if spy_ctx.get("overbought"):
             return "SCALP"
         if (spy_ctx.get("strong") and
@@ -1210,57 +1244,45 @@ class SymbolBot:
         return "SCALP"
 
     def get_exit_params(self) -> tuple:
-        """Returns (atr_stop, early_ratchet, late_ratchet, trail_normal, trail_tight)."""
         if self.active_sym == self.bear_pair:
-            br = BEAR_RECIPES.get(self.bear_pair, self.cfg)
-            sl         = br["atr_stop"]
-            early_r    = br["early_ratchet"]
-            late_r     = early_r * 1.8
-            trail_n    = br["trail"]
-            trail_t    = round(trail_n * 0.7, 4)
-            return sl, early_r, late_r, trail_n, trail_t
-
-        sl      = self.cfg["atr_stop"]
-        early_r = self.cfg["early_ratchet"]
-        late_r  = self.cfg["late_ratchet"]
-        trail_n = self.cfg["trail_normal"]
-        trail_t = self.cfg["trail_tight"]
-
-        mult = self.cfg.get("ride_stop_mult", 1.3) if self.mode == "RIDE" else \
-               self.cfg.get("ext_stop_mult",  1.8) if self.mode == "EXTENDED" else 1.0
-        sl = round(sl * mult, 4)
+            br      = BEAR_RECIPES.get(self.bear_pair, self.cfg)
+            sl      = br["atr_stop"]
+            early_r = br["early_ratchet"]
+            late_r  = early_r * 2.0
+            trail_n = br["trail"]
+            trail_t = trail_n * 0.75
+        else:
+            mode_mult = (self.cfg["ext_stop_mult"] if self.mode == "EXTENDED" else
+                         self.cfg["ride_stop_mult"] if self.mode == "RIDE" else 1.0)
+            sl      = self.cfg["atr_stop"] * mode_mult
+            early_r = self.cfg["early_ratchet"]
+            late_r  = self.cfg["late_ratchet"]
+            trail_n = self.cfg["trail_normal"]
+            trail_t = self.cfg["trail_tight"]
         return sl, early_r, late_r, trail_n, trail_t
 
     def should_enter_bull(self, spy_ctx: dict, sym_ctx: dict,
-                          underlying_ctx: dict) -> tuple:
-        """
-        V1.6: Confluence score entry — replaces RSI-only gate.
-        Returns (should_enter, score, reasons).
-        """
-        now = datetime.now(tz=CENTRAL)
-        if now.hour in self.cfg.get("avoid_hours", []):
+                           underlying_ctx: dict) -> tuple:
+        now_hour = datetime.now(tz=CENTRAL).hour
+        if now_hour in self.cfg.get("avoid_hours", []):
             return False, 0, "avoid_hour"
-        if now.weekday() in self.cfg.get("avoid_days", []):
+        if now_hour in self.cfg.get("avoid_days", []):
             return False, 0, "avoid_day"
+        if get_vix() >= VIX_PAUSE:
+            return False, 0, "vix_pause"
 
-        # VIX regime gate
-        vix = get_vix()
-        if vix >= VIX_PAUSE:
-            return False, 0, f"vix_pause({vix:.1f})"
-
-        # Need at least a bounce — still required as minimum trigger
         if not sym_ctx.get("bouncing"):
             return False, 0, "no_bounce"
 
-        # Underlying tide check (Layer 1)
-        # If underlying data available and tide is bearish, skip
         if underlying_ctx.get("available") and underlying_ctx.get("tide_bearish"):
             return False, 0, "tide_bearish"
 
-        # Compute confluence score
-        score    = self.compute_entry_score(self.symbol, sym_ctx)
-        min_sc   = self.cfg["min_score"]
+        # V2.0: Volume confirmation gate
+        if not sym_ctx.get("vol_confirmed", True):
+            return False, 0, "vol_not_confirmed"
 
+        score  = self.compute_entry_score(self.symbol, sym_ctx)
+        min_sc = self.cfg["min_score"]
         if score < min_sc:
             return False, score, f"score_{score}<{min_sc}"
 
@@ -1268,46 +1290,28 @@ class SymbolBot:
 
     def score_reversal_quality(self, bull_rsi: float, drop: float,
                                 bear_ctx: dict) -> int:
-        """
-        V1.6: Score the quality of a reversal signal 0-3.
-        0 = skip, 1 = weak (half size), 2 = medium (normal size), 3 = strong (full + 25%)
-        """
         score = 0
-
-        # RSI level at reversal
         if bull_rsi >= REVERSAL_HIGH_RSI:
             score += 2
         elif bull_rsi >= REVERSAL_OB_RSI:
             score += 1
-
-        # Drop magnitude
         if drop >= REVERSAL_HIGH_DROP:
             score += 1
-
-        # Bear pair already moving
         if bear_ctx.get("rsi", 50) < 45:
             score += 1
         if bear_ctx.get("obv_rising"):
             score += 1
-
-        # Bear trap check — if underlying at multi-day high + volume expanding,
-        # this may be a continuation not a reversal
         underlying_ctx = get_underlying_context(
             BEAR_RECIPES.get(self.bear_pair, {}).get("underlying", "QQQ"))
         if underlying_ctx.get("at_high") and underlying_ctx.get("tide_bullish"):
-            score -= 2  # strong bear trap signal
-
+            score -= 2
         return max(0, min(3, score))
 
     def check_reversal(self) -> tuple:
-        """
-        V1.6: Returns (should_enter, reversal_quality).
-        quality 0 = skip, 1-3 = enter with scaled size.
-        Now includes quality scoring and bear trap detection.
-        """
-        if len(self.prices) < 8:
+        prices, _ = get_prices(self.symbol)
+        if len(prices) < 8:
             return False, 0
-        bull_rsi = compute_rsi(self.prices)
+        bull_rsi = compute_rsi(prices)
         if bull_rsi is None:
             return False, 0
 
@@ -1318,7 +1322,7 @@ class SymbolBot:
             if bull_rsi >= REVERSAL_OB_RSI:
                 self.reversal_state = {
                     "state":       "WATCHING",
-                    "bull_peak":   self.prices[-1],
+                    "bull_peak":   prices[-1],
                     "watch_start": now_t,
                 }
                 log(self.symbol, f"👁 REVERSAL WATCH -> {self.bear_pair} | RSI={bull_rsi:.1f}")
@@ -1333,38 +1337,30 @@ class SymbolBot:
                 self.reversal_state = {"state": "IDLE"}
                 return False, 0
 
-            bull_peak = max(state.get("bull_peak", self.prices[-1]), self.prices[-1])
+            bull_peak = max(state.get("bull_peak", prices[-1]), prices[-1])
             self.reversal_state["bull_peak"] = bull_peak
-            drop = (bull_peak - self.prices[-1]) / bull_peak if bull_peak > 0 else 0
+            drop = (bull_peak - prices[-1]) / bull_peak if bull_peak > 0 else 0
 
             if drop >= REVERSAL_CONFIRM:
-                # Bear bounce check
-                if len(self.bear_prices) < 3 or self.bear_prices[-1] <= self.bear_prices[-3]:
+                bear_prices, bear_vols = get_prices(self.bear_pair)
+                if len(bear_prices) < 3 or bear_prices[-1] <= bear_prices[-3]:
                     return False, 0
 
-                # Hour gate for bear pair
                 now_hour   = datetime.now(tz=CENTRAL).hour
                 bear_avoid = BEAR_RECIPES.get(self.bear_pair, {}).get("avoid_hours", [])
                 if now_hour in bear_avoid:
-                    log(self.symbol, f"⏰ REVERSAL GATED: {self.bear_pair} hour {now_hour}")
                     return False, 0
 
-                # SQQQ gate -- V1.9: enabled by default but requires SPY bear regime
-                # (SPY below 20-day MA). During bull markets SQQQ has negative EV;
-                # in bear/correction regimes it's the right trade.
-                if self.bear_pair == "SQQQ":
-                    if not SQQQ_ENABLED:
-                        return False, 0
-                    spy_ctx_sq = get_spy_context()
-                    spy_above_ma = spy_ctx_sq.get("above_ma20", True)
-                    if spy_above_ma:
-                        log(self.symbol,
-                            f"🚫 SQQQ blocked: SPY above MA20 (bull regime) -- "
-                            f"SQQQ only fires in bear regime")
-                        return False, 0
-                    log(self.symbol, f"✅ SQQQ bear regime confirmed: SPY below MA20")
+                if self.bear_pair == "SQQQ" and not SQQQ_ENABLED:
+                    return False, 0
 
-                # QQQ filters
+                # SQQQ: only when SPY is in bear regime
+                if self.bear_pair == "SQQQ":
+                    spy_ctx = get_spy_context()
+                    if spy_ctx.get("bullish"):
+                        log(self.symbol, "⛔ SQQQ gated: SPY still bullish")
+                        return False, 0
+
                 qqq_ctx = get_qqq_context()
                 if qqq_ctx.get("oversold"):
                     return False, 0
@@ -1372,20 +1368,23 @@ class SymbolBot:
                 if qqq_ctx.get("rsi", 50) < gate:
                     return False, 0
 
-                # Bear pair confluence score
-                bear_ctx  = self.get_signal_suite(self.bear_prices, self.bear_volumes)
-                bear_min  = BEAR_RECIPES.get(self.bear_pair, {}).get("min_score", 4)
+                bear_ctx   = self.get_signal_suite(bear_prices, bear_vols)
+                bear_min   = BEAR_RECIPES.get(self.bear_pair, {}).get("min_score", 4)
                 bear_score = self.compute_entry_score(self.bear_pair, bear_ctx)
+
+                # V2.0: Volume confirmation on bear entry too
+                if not bear_ctx.get("vol_confirmed", True):
+                    log(self.symbol, f"⚠ REVERSAL: {self.bear_pair} volume not confirmed — skip")
+                    return False, 0
+
                 if bear_score < bear_min:
                     log(self.symbol,
                         f"⚠ REVERSAL LOW SCORE: {self.bear_pair} score={bear_score} < {bear_min}")
                     return False, 0
 
-                # Score the reversal quality
                 quality = self.score_reversal_quality(bull_rsi, drop, bear_ctx)
                 if quality == 0:
-                    log(self.symbol,
-                        f"🚫 REVERSAL QUALITY=0 (bear trap detected or too weak) — skip")
+                    log(self.symbol, "🚫 REVERSAL QUALITY=0 — skip")
                     return False, 0
 
                 log(self.symbol,
@@ -1397,39 +1396,28 @@ class SymbolBot:
 
         return False, 0
 
-    def try_buy(self, sym: str, prices: list, volumes: list,
-                spy_ctx: dict, sym_ctx: dict,
-                reversal_quality: int = 0) -> bool:
-        """
-        V1.6: Asymmetric position sizing by conviction.
-        signal_boost 2 = 100% | 1 = 80% | 0 = 60%
-        reversal_quality 3 = +25% bonus | 2 = normal | 1 = 50%
-        VIX caution = 50% of computed size
-        """
-        bp         = get_buying_power(self.acct_id)
+    def try_buy(self, sym: str, sym_ctx: dict, reversal_quality: int = 0) -> bool:
+        bp         = get_buying_power()
         base_size  = round(bp * self.budget_pct, 2)
         if base_size < 1.00:
             return False
 
         is_bear     = (sym == self.bear_pair)
         entry_score = self.compute_entry_score(sym, sym_ctx)
+        spy_ctx     = get_spy_context()
         self.mode   = self.select_mode(spy_ctx, sym_ctx)
 
-        # Analyst bridge
         analyst_scores = fetch_analyst_scores()
         analyst_entry  = analyst_scores.get(sym, {})
         analyst_score  = analyst_entry.get("score", 0)
         signal_boost, active_signals = get_analyst_signal_boost(sym, analyst_scores)
 
-        # Underlying context
         underlying     = self.cfg["underlying"] if not is_bear else BEAR_RECIPES.get(sym, {}).get("underlying", "QQQ")
         underlying_ctx = get_underlying_context(underlying)
         tide_bullish   = underlying_ctx.get("tide_bullish", False)
         vix            = get_vix()
+        qqq_ctx        = get_qqq_context()
 
-        qqq_ctx = get_qqq_context()
-
-        # Win-rate gate from pattern memory
         if _phase4_memory:
             hour = datetime.now(tz=CENTRAL).hour
             skip, wr, has_data = _phase4_memory.should_skip_entry(
@@ -1439,6 +1427,12 @@ class SymbolBot:
             if skip:
                 log(self.symbol, f"🚫 WIN-RATE GATE: {sym} historical WR={wr:.0%}")
                 return False
+
+        # V2.0: ADX check for trend modes
+        adx = sym_ctx.get("adx", 25.0)
+        if adx < ADX_TREND_THRESHOLD and not is_bear:
+            log(self.symbol, f"⚠ ADX={adx:.1f} < {ADX_TREND_THRESHOLD} — ranging market, SCALP forced")
+            self.mode = "SCALP"
 
         # Asymmetric sizing
         size_mult = 1.0 if signal_boost == 2 else 0.8 if signal_boost == 1 else 0.6
@@ -1450,35 +1444,33 @@ class SymbolBot:
             size_mult *= 0.5
             log(self.symbol, f"⚠ VIX={vix:.1f} — reducing size 50%")
 
-        trade_size = round(base_size * size_mult, 2)
-        if trade_size < 1.00:
+        trade_notional = round(base_size * size_mult, 2)
+        if trade_notional < 1.00:
             return False
 
-        price = prices[-1] if prices else get_current_price(sym)
+        price = get_current_price(sym)
         if not price or price <= 0:
             return False
 
-        qty = int(trade_size / (price * BUYING_POWER_BUFFER))
-        if qty < 1:
-            return False
-
-        boost_label  = " 🔥COMBO" if signal_boost == 2 else " ✨sig" if signal_boost == 1 else ""
-        tide_label   = " 🌊TIDE" if tide_bullish else ""
+        boost_label = " 🔥COMBO" if signal_boost == 2 else " ✨sig" if signal_boost == 1 else ""
+        tide_label  = " 🌊TIDE" if tide_bullish else ""
+        adx_label   = f" ADX={adx:.0f}" if adx > 0 else ""
         log(self.symbol,
             f"📊 BUY signal | score={entry_score} | mode={self.mode} | "
-            f"RSI={sym_ctx['rsi']:.1f} | size_mult={size_mult:.0%} | "
-            f"analyst={analyst_score}{boost_label}{tide_label}")
+            f"RSI={sym_ctx['rsi']:.1f} | ${trade_notional:.0f} ({size_mult:.0%})"
+            f"{boost_label}{tide_label}{adx_label}")
 
-        success = place_order(sym, "BUY", qty, self.acct_id)
+        success = place_order(sym, "BUY", trade_notional)
         if success:
             self.in_position           = True
             self.active_sym            = sym
             self.entry_price           = price
+            self.entry_notional        = trade_notional
             self.peak_price            = price
             self.entry_time            = time.time()
             self.mfe                   = 0.0
             self.mae                   = 0.0
-            self.trade_id              = __import__('secrets').token_hex(8)
+            self.trade_id              = secrets.token_hex(8)
             self._entry_spy_ctx        = spy_ctx
             self._entry_qqq_ctx        = qqq_ctx
             self._entry_sym_ctx        = sym_ctx
@@ -1492,7 +1484,6 @@ class SymbolBot:
             self._bear_ext_trailing    = False
             self._bear_ext_peak        = price
             self._late_ratchet_active  = False
-            invalidate_pos_cache()
 
             if _phase4_memory:
                 _phase4_memory.record_entry(
@@ -1504,27 +1495,17 @@ class SymbolBot:
                 )
 
             log(self.symbol,
-                f"⚡ BUY: {sym} | {qty}sh @ ~${round(price,2)} | mode={self.mode} | "
-                f"size={round(trade_size,2)} ({size_mult:.0%}){boost_label}")
+                f"⚡ BUY: {sym} | ${trade_notional:.0f} notional @ ~${round(price,2)} | "
+                f"mode={self.mode}{boost_label}")
             alert(
-                f"⚡ PHASE4 BUY [{self.mode}]: {sym} | {qty} @ ~${round(price,2)}"
+                f"⚡ PHASE4 BUY [{self.mode}]: {sym} | ${trade_notional:.0f}"
                 f"\nscore={entry_score} | boost={signal_boost} | vix={vix:.1f}{boost_label}"
             )
             return True
         return False
 
     def try_sell(self, reason: str, pnl_pct: float) -> bool:
-        positions = get_all_positions(self.acct_id)
-        if self.active_sym not in positions:
-            self.in_position = False
-            return True
-        pos = positions[self.active_sym]
-        qty = int(float(pos.get("quantity", pos.get("position_qty", 0))))
-        if qty <= 0:
-            self.in_position = False
-            return True
-
-        success = place_order(self.active_sym, "SELL", qty, self.acct_id)
+        success = place_order(self.active_sym, "SELL", 0)   # qty pulled from positions
         if success:
             emoji    = "✅" if pnl_pct > 0 else "🛑"
             pnl_s    = f"+{round(pnl_pct*100,3)}%" if pnl_pct > 0 else f"{round(pnl_pct*100,3)}%"
@@ -1544,6 +1525,7 @@ class SymbolBot:
             self.in_position           = False
             self.peak_price            = 0.0
             self.entry_price           = 0.0
+            self.entry_notional        = 0.0
             self.entry_time            = 0.0
             self.trade_id              = ""
             self.mfe                   = 0.0
@@ -1552,50 +1534,51 @@ class SymbolBot:
             self._bear_ext_peak        = 0.0
             self._late_ratchet_active  = False
 
+            # V2.0: Daily P&L tracking
+            self.daily_pnl += pnl_pct
             if pnl_pct > 0:
                 self.daily_wins += 1
                 self.set_cooldown(WIN_COOLDOWN_SECS)
             else:
                 self.daily_losses += 1
                 self.set_cooldown(LOSS_COOLDOWN_SECS)
-            self.daily_pnl += pnl_pct * 100
-            invalidate_pos_cache()
             return True
         return False
 
     def recover_position(self):
-        """V1.5+: generates trade_id, entry_time, infers mode."""
-        positions = get_all_positions(self.acct_id)
+        """On boot: check Alpaca positions and recover any open Phase4 position."""
+        positions = get_all_positions()
         for sym in [self.symbol, self.bear_pair]:
             if sym in positions:
                 pos              = positions[sym]
-                cost             = float(pos.get("cost_price", pos.get("average_cost", 0)))
+                cost             = float(pos.avg_entry_price)
+                qty              = float(pos.qty)
                 self.in_position = True
                 self.active_sym  = sym
                 self.entry_price = cost
+                self.entry_notional = cost * qty
                 self.peak_price  = max(cost, get_current_price(sym) or cost)
-                self.trade_id    = __import__('secrets').token_hex(8)
+                self.trade_id    = secrets.token_hex(8)
                 self.entry_time  = time.time()
                 self.mfe         = 0.0
                 self.mae         = 0.0
+                prices, _        = get_prices(sym)
                 spy_ctx          = get_spy_context()
-                sym_ctx          = self.get_signal_suite(self.prices, self.volumes)
+                sym_ctx          = self.get_signal_suite(prices, list(_volume_history.get(sym, [])))
                 self.mode        = self.select_mode(spy_ctx, sym_ctx)
                 self._bear_ext_trailing   = False
                 self._bear_ext_peak       = self.peak_price
                 self._late_ratchet_active = False
                 log(self.symbol,
-                    f"🔄 Recovered: {sym} | entry=${cost:.3f} | mode={self.mode} | "
-                    f"trade_id={self.trade_id[:8]}")
+                    f"🔄 Recovered: {sym} | entry=${cost:.3f} | qty={qty:.4f} | "
+                    f"mode={self.mode} | trade_id={self.trade_id[:8]}")
                 return
 
     def run_loop(self):
         log(self.symbol,
             f"🚀 Bot online | bear={self.bear_pair} | underlying={self.underlying} | "
             f"budget={int(self.budget_pct*100)}% | min_score={self.cfg['min_score']}")
-
-        self.refresh_prices()
-        log(self.symbol, f"✅ Warmed up | {len(self.prices)} bars")
+        time.sleep(8)   # let context thread warm up
         self.recover_position()
 
         while True:
@@ -1604,126 +1587,159 @@ class SymbolBot:
                     if self.in_position:
                         log(self.symbol, "📌 Market closed — holding overnight")
                     time.sleep(60)
+                    # Reset daily limit flag at midnight
+                    now = datetime.now(tz=CENTRAL)
+                    if now.hour == 0 and now.minute < 2:
+                        self._daily_limit_hit = False
                     continue
 
-                self.refresh_prices()
-                spy_ctx        = get_spy_context()
-                sym_ctx        = self.get_signal_suite(self.prices, self.volumes)
-                underlying_ctx = get_underlying_context(self.underlying)
+                # V2.0: Daily loss limit per bot
+                if self.check_daily_loss_limit():
+                    time.sleep(60)
+                    continue
 
-                prices = self.prices
-                if not prices:
+                prices, volumes = get_prices(self.symbol)
+                if len(prices) < WARMUP_BARS:
+                    log(self.symbol, f"⏳ Warming up: {len(prices)}/{WARMUP_BARS} bars")
                     time.sleep(LOOP_INTERVAL)
                     continue
 
-                # ── MANAGE OPEN POSITION ─────────────────────────────────
+                spy_ctx        = get_spy_context()
+                underlying_ctx = get_underlying_context(self.underlying)
+                sym_ctx        = self.get_signal_suite(prices, volumes)
+
                 if self.in_position:
-                    active_prices  = self.prices  if self.active_sym == self.symbol else self.bear_prices
-                    active_volumes = self.volumes if self.active_sym == self.symbol else self.bear_volumes
-                    active_ctx     = self.get_signal_suite(active_prices, active_volumes)
-                    if not active_prices:
+                    price = get_current_price(self.active_sym)
+                    if not price or price <= 0:
                         time.sleep(LOOP_INTERVAL)
                         continue
 
-                    price      = active_prices[-1]
-                    profit_pct = (price - self.entry_price) / self.entry_price if self.entry_price > 0 else 0
-                    drawdown   = (self.peak_price - price) / self.peak_price if self.peak_price > 0 else 0
+                    if self.entry_price <= 0:
+                        time.sleep(LOOP_INTERVAL)
+                        continue
 
+                    profit_pct = (price - self.entry_price) / self.entry_price
+                    self.mfe   = max(self.mfe, profit_pct)
+                    self.mae   = min(self.mae, profit_pct)
                     self.peak_price = max(self.peak_price, price)
-                    self.mfe        = max(self.mfe, profit_pct)
-                    self.mae        = min(self.mae, profit_pct)
+                    drawdown   = (self.peak_price - price) / self.peak_price if self.peak_price > 0 else 0
 
                     sl, early_r, late_r, trail_n, trail_t = self.get_exit_params()
 
-                    log(self.symbol,
-                        f"📊 {self.active_sym} | P&L={round(profit_pct*100,2):+.2f}% | "
-                        f"peak=${self.peak_price:.3f} | dd={round(drawdown*100,2):.2f}% | "
-                        f"mode={self.mode} | rsi={active_ctx.get('rsi',50):.0f}")
+                    # V2.0: Underlying reversal exit — get out before the trail fires
+                    # When underlying (SMH, GDX, etc.) shows RSI overbought + MACD turning,
+                    # exit the bull ETF early. Only for bull positions, only if in profit.
+                    if (not (self.active_sym == self.bear_pair) and
+                            profit_pct > 0.002 and
+                            underlying_ctx.get("reversal_warning") and
+                            not self._late_ratchet_active):
+                        log(self.symbol,
+                            f"📡 UNDERLYING REVERSAL SIGNAL: {self.underlying} turning | "
+                            f"exiting {self.active_sym} early at {profit_pct*100:+.2f}%")
+                        self.try_sell("underlying-reversal", profit_pct)
+                        time.sleep(LOOP_INTERVAL)
+                        continue
 
-                    # ── BEAR PAIR: extended TP for DUST/SOXS ─────────────
-                    ext_cfg = BEAR_EXTENDED_TP.get(self.active_sym) if self.active_sym == self.bear_pair else None
-                    if ext_cfg:
-                        self._bear_ext_peak = max(self._bear_ext_peak, price)
-                        if not self._bear_ext_trailing and profit_pct >= ext_cfg["trail_activate"]:
-                            self._bear_ext_trailing = True
-                            log(self.symbol,
-                                f"🎯 {self.active_sym} EXTENDED TP activated at +{profit_pct*100:.1f}%")
-                        if self._bear_ext_trailing:
-                            ext_dd = (self._bear_ext_peak - price) / self._bear_ext_peak if self._bear_ext_peak > 0 else 0
-                            if ext_dd >= ext_cfg["trail_stop"]:
-                                self.try_sell("ext-trail", profit_pct)
-                                time.sleep(LOOP_INTERVAL)
-                                continue
-                        if profit_pct <= -sl:
-                            self.try_sell("stop-loss", profit_pct)
-
+                    if self.active_sym == self.bear_pair:
+                        ext_cfg = BEAR_EXTENDED_TP.get(self.active_sym)
+                        if ext_cfg:
+                            self._bear_ext_peak = max(self._bear_ext_peak, price)
+                            if not self._bear_ext_trailing and profit_pct >= ext_cfg["trail_activate"]:
+                                self._bear_ext_trailing = True
+                                log(self.symbol,
+                                    f"🎯 {self.active_sym} EXTENDED TP activated at +{profit_pct*100:.1f}%")
+                            if self._bear_ext_trailing:
+                                ext_dd = (self._bear_ext_peak - price) / self._bear_ext_peak if self._bear_ext_peak > 0 else 0
+                                if ext_dd >= ext_cfg["trail_stop"]:
+                                    self.try_sell("ext-trail", profit_pct)
+                                    time.sleep(LOOP_INTERVAL)
+                                    continue
+                            if profit_pct <= -sl:
+                                self.try_sell("stop-loss", profit_pct)
+                        else:
+                            if profit_pct <= -sl:
+                                self.try_sell("stop-loss", profit_pct)
+                            elif (sym_ctx.get("rsi", 50) >= RSI_OVERBOUGHT_EXIT and profit_pct > 0):
+                                log(self.symbol,
+                                    f"🔄 RSI REVERSAL EXIT: RSI={sym_ctx['rsi']:.0f} >= {RSI_OVERBOUGHT_EXIT}")
+                                self.try_sell("rsi-overbought", profit_pct)
+                            elif profit_pct >= early_r:
+                                rsi_now  = sym_ctx.get("rsi", 50)
+                                obv_flat = not sym_ctx.get("obv_rising") and not sym_ctx.get("obv_falling")
+                                if (profit_pct >= late_r or rsi_now >= 65 or
+                                        (obv_flat and profit_pct >= early_r * 1.5)):
+                                    self._late_ratchet_active = True
+                                trail = trail_t if self._late_ratchet_active else trail_n
+                                if drawdown >= trail:
+                                    reason = "trail-tight" if self._late_ratchet_active else "trail"
+                                    self.try_sell(reason, profit_pct)
+                            elif (self.mode == "EXTENDED" and
+                                  self.active_sym == self.symbol and
+                                  profit_pct > -0.005):
+                                if not sym_ctx.get("higher_lows", True):
+                                    log(self.symbol, "📉 EXTENDED: trend break")
+                                    self.try_sell("trend-break", profit_pct)
+                            elif self.entry_time > 0:
+                                held_min = (time.time() - self.entry_time) / 60
+                                if (held_min >= DWELL_MINUTES and
+                                        abs(profit_pct) < DWELL_FLAT_THRESHOLD):
+                                    log(self.symbol,
+                                        f"⏱ DWELL EXIT: {held_min:.0f}m | flat at {profit_pct*100:+.3f}%")
+                                    self.try_sell("dwell", profit_pct)
                     else:
-                        # ── STOP LOSS ─────────────────────────────────────
                         if profit_pct <= -sl:
                             self.try_sell("stop-loss", profit_pct)
-
-                        # ── SIGNAL REVERSAL EXIT ──────────────────────────
-                        # If RSI hit overbought and we entered on oversold = reversion complete
-                        elif (active_ctx.get("rsi", 50) >= RSI_OVERBOUGHT_EXIT
-                              and profit_pct > 0):
+                        elif (sym_ctx.get("rsi", 50) >= RSI_OVERBOUGHT_EXIT and profit_pct > 0):
                             log(self.symbol,
-                                f"🔄 RSI REVERSAL EXIT: RSI={active_ctx['rsi']:.0f} >= {RSI_OVERBOUGHT_EXIT}")
+                                f"🔄 RSI REVERSAL EXIT: RSI={sym_ctx['rsi']:.0f} >= {RSI_OVERBOUGHT_EXIT}")
                             self.try_sell("rsi-overbought", profit_pct)
-
-                        # ── ADAPTIVE RATCHET ──────────────────────────────
                         elif profit_pct >= early_r:
-                            # Check if we should switch to tight trailing
-                            rsi_now  = active_ctx.get("rsi", 50)
-                            obv_flat = not active_ctx.get("obv_rising") and not active_ctx.get("obv_falling")
-
-                            # Activate late (tight) ratchet when momentum peaks
+                            rsi_now  = sym_ctx.get("rsi", 50)
+                            obv_flat = not sym_ctx.get("obv_rising") and not sym_ctx.get("obv_falling")
                             if (profit_pct >= late_r or rsi_now >= 65 or
                                     (obv_flat and profit_pct >= early_r * 1.5)):
                                 self._late_ratchet_active = True
-
                             trail = trail_t if self._late_ratchet_active else trail_n
                             if drawdown >= trail:
                                 reason = "trail-tight" if self._late_ratchet_active else "trail"
                                 self.try_sell(reason, profit_pct)
-
-                        # ── EXTENDED: exit on trend break ─────────────────
-                        elif (self.mode == "EXTENDED"
-                              and self.active_sym == self.symbol
-                              and profit_pct > -0.005):
-                            if not active_ctx.get("higher_lows", True):
+                        elif (self.mode == "EXTENDED" and
+                              self.active_sym == self.symbol and
+                              profit_pct > -0.005):
+                            if not sym_ctx.get("higher_lows", True):
                                 log(self.symbol, "📉 EXTENDED: trend break")
                                 self.try_sell("trend-break", profit_pct)
-
-                        # ── TIME-IN-DWELL EXIT ────────────────────────────
-                        # Flat position = dead money = exit and redeploy
                         elif self.entry_time > 0:
                             held_min = (time.time() - self.entry_time) / 60
-                            if (held_min >= DWELL_MINUTES
-                                    and abs(profit_pct) < DWELL_FLAT_THRESHOLD):
+                            if (held_min >= DWELL_MINUTES and
+                                    abs(profit_pct) < DWELL_FLAT_THRESHOLD):
                                 log(self.symbol,
                                     f"⏱ DWELL EXIT: {held_min:.0f}m | flat at {profit_pct*100:+.3f}%")
                                 self.try_sell("dwell", profit_pct)
 
-                # ── LOOK FOR ENTRY ────────────────────────────────────────
+                    log(self.symbol,
+                        f"📍 IN POS: {self.active_sym} | {profit_pct*100:+.3f}% | "
+                        f"peak={self.peak_price:.3f} | mode={self.mode} | "
+                        f"rsi={sym_ctx.get('rsi',50):.0f} | adx={sym_ctx.get('adx',0):.0f}")
+
                 elif not self.is_on_cooldown():
-                    # Bear reversal check (higher priority)
                     rev_ok, rev_quality = self.check_reversal()
                     if rev_ok:
-                        if not self.bear_prices:
+                        bear_prices, bear_vols = get_prices(self.bear_pair)
+                        if not bear_prices:
                             log(self.symbol, "⚠ Reversal but bear_prices empty — skip")
                         else:
-                            bear_ctx = self.get_signal_suite(self.bear_prices, self.bear_volumes)
-                            self.try_buy(self.bear_pair, self.bear_prices, self.bear_volumes,
-                                         spy_ctx, bear_ctx, reversal_quality=rev_quality)
+                            bear_ctx = self.get_signal_suite(bear_prices, bear_vols)
+                            self.try_buy(self.bear_pair, bear_ctx, reversal_quality=rev_quality)
                     else:
-                        # Bull entry — confluence score gate
                         should_enter, score, reason = self.should_enter_bull(
                             spy_ctx, sym_ctx, underlying_ctx)
                         if should_enter:
-                            self.try_buy(self.symbol, prices, self.volumes, spy_ctx, sym_ctx)
+                            self.try_buy(self.symbol, sym_ctx)
                         elif score > 0:
+                            adx_note = f" | ADX={sym_ctx.get('adx',0):.0f}"
                             log(self.symbol,
-                                f"⏳ score={score} (need {self.cfg['min_score']}) | {reason}")
+                                f"⏳ score={score} (need {self.cfg['min_score']}) | {reason}{adx_note}")
 
             except Exception as e:
                 log(self.symbol, f"🔴 Loop error: {e}")
@@ -1735,11 +1751,17 @@ class SymbolBot:
 # ── Phase4 Service ────────────────────────────────────────────────────────────
 def run():
     global _phase4_memory
-    print("[PHASE4] NEXUS PHASE 4 V1.9 STARTING", flush=True)
+    print("[PHASE4] NEXUS PHASE 4 V2.0 STARTING — Alpaca Edition", flush=True)
+    print("[PHASE4] Broker: Alpaca (was Webull) | Fractional shares | Real-time IEX feed", flush=True)
     print("[PHASE4] Bots: NUGT(30%) | SOXL(25%) | LABU(25%) | TQQQ(20%)", flush=True)
-    print("[PHASE4] Bear pairs: DUST | SOXS | LABD" + (" | SQQQ" if SQQQ_ENABLED else " | SQQQ(DISABLED)"), flush=True)
-    print("[PHASE4] V1.6: Confluence score entry | Underlying index | ATR stops | Adaptive ratchet", flush=True)
-    print("[PHASE4] V1.6: Asymmetric sizing | Reversal quality | Bear trap detect | Dwell exit", flush=True)
+    print("[PHASE4] Bear pairs: DUST | SOXS | LABD" +
+          (" | SQQQ" if SQQQ_ENABLED else " | SQQQ(DISABLED)"), flush=True)
+    print("[PHASE4] V2.0: ADX regime filter | Vol confirmation | Underlying exit | Daily limits",
+          flush=True)
+
+    if not ALPACA_API_KEY or not ALPACA_SECRET:
+        print("[PHASE4] 🔴 ALPACA_PHASE4_API_KEY / ALPACA_PHASE4_SECRET_KEY not set!", flush=True)
+        print("[PHASE4] Set these in Railway env vars for nexus-phase4 service", flush=True)
 
     if DATABASE_URL and _db_available:
         _phase4_memory = Phase4Memory(DATABASE_URL)
@@ -1750,54 +1772,62 @@ def run():
         _phase4_memory = Phase4Memory("")
         print("[PHASE4] Pattern memory: disabled (no DATABASE_URL)", flush=True)
 
-    acct_id = get_account_id()
-    if not acct_id:
-        print("[PHASE4] 🔴 Could not get Webull account ID", flush=True)
-        return
-
-    print(f"[PHASE4] Account: {acct_id}", flush=True)
-    print(f"[PHASE4] Analyst bridge: {ANALYST_URL if ANALYST_URL else 'disabled'}", flush=True)
-    print(f"[PHASE4] VIX caution={VIX_CAUTION} / pause={VIX_PAUSE}", flush=True)
-
-    ctx_thread = threading.Thread(target=refresh_context_data, daemon=True)
+    # Start context refresh thread FIRST — bots wait for warmup
+    ctx_thread = threading.Thread(target=context_refresh_loop, daemon=True, name="p4-data")
     ctx_thread.start()
-    time.sleep(8)  # let underlyings warm up before bots start
+    print("[PHASE4] Context refresh thread started — waiting 15s for data warmup...", flush=True)
+    time.sleep(15)
+
+    # Verify we got data
+    with _context_lock:
+        spy_ok  = len(_price_history.get("SPY", [])) > 0
+        soxl_ok = len(_price_history.get("SOXL", [])) > 0
+    print(f"[PHASE4] Data check: SPY={'✅' if spy_ok else '⚠ EMPTY'} | "
+          f"SOXL={'✅' if soxl_ok else '⚠ EMPTY'}", flush=True)
+
+    # Try to get account info
+    try:
+        acct = trading_client.get_account()
+        bp   = float(acct.buying_power)
+        print(f"[PHASE4] Alpaca account: buying_power=${bp:.2f} | paper={IS_PAPER}", flush=True)
+    except Exception as e:
+        print(f"[PHASE4] ⚠ Alpaca account fetch error: {e}", flush=True)
 
     bots    = []
     threads = []
     for symbol, config in BOT_CONFIGS.items():
-        bot = SymbolBot(symbol, config, acct_id)
+        bot = SymbolBot(symbol, config)
         bots.append(bot)
         t = threading.Thread(target=bot.run_loop, daemon=True, name=f"bot_{symbol}")
         threads.append(t)
         t.start()
-        print(f"[PHASE4] ✅ {symbol} bot started (underlying={config['underlying']}, min_score={config['min_score']})", flush=True)
+        print(f"[PHASE4] ✅ {symbol} bot started (underlying={config['underlying']}, "
+              f"min_score={config['min_score']})", flush=True)
         time.sleep(2)
-
-    from phase4_server import start_server
-    start_server(bots)
 
     vix_now = get_vix()
     alert(
-        f"⚡ PHASE4 V1.8 ONLINE\n"
-        f"Confluence scoring | Underlying index | Adaptive exits\n"
+        f"⚡ PHASE4 V2.0 ONLINE — Alpaca Edition\n"
+        f"Broker: Alpaca | Fractional shares | IEX real-time\n"
         f"SOXL(SMH) TQQQ(QQQ) NUGT(GDX) LABU(XBI)\n"
         f"VIX: {vix_now:.1f} | SQQQ: {'ON' if SQQQ_ENABLED else 'OFF'}\n"
-        f"Analyst: {'✅' if ANALYST_URL else '⚠ disabled'}\n"
-        f"V1.8: StochRSI Wilder fix | Score double-count fix"
+        f"V2.0: ADX filter | Vol confirm | Underlying exit | Daily limits"
     )
-    print("[PHASE4] All bots running.", flush=True)
+
+    from phase4_server import start_server
+    start_server(bots)
 
     last_day = datetime.now(tz=CENTRAL).date()
     while True:
         today = datetime.now(tz=CENTRAL).date()
         if today != last_day:
             for bot in bots:
-                bot.daily_wins   = 0
-                bot.daily_losses = 0
-                bot.daily_pnl    = 0.0
+                bot.daily_wins        = 0
+                bot.daily_losses      = 0
+                bot.daily_pnl         = 0.0
+                bot._daily_limit_hit  = False
             last_day = today
-            print("[PHASE4] 🌅 Daily reset", flush=True)
+            print("[PHASE4] 🌅 Daily reset — all bots active", flush=True)
         time.sleep(60)
 
 
