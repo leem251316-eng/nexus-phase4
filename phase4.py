@@ -71,8 +71,12 @@ except ImportError:
     _db_available = False
 
 # ── Env ───────────────────────────────────────────────────────────────────────
-ALPACA_API_KEY   = os.environ.get("ALPACA_PHASE4_API_KEY", "")
-ALPACA_SECRET    = os.environ.get("ALPACA_PHASE4_SECRET_KEY", "")
+# Reads ALPACA_API_KEY / ALPACA_SECRET_KEY (already set in Railway nexus-phase4 service)
+# Falls back to ALPACA_PHASE4_API_KEY / ALPACA_PHASE4_SECRET_KEY if you prefer separation
+ALPACA_API_KEY   = (os.environ.get("ALPACA_PHASE4_API_KEY")
+                    or os.environ.get("ALPACA_API_KEY", ""))
+ALPACA_SECRET    = (os.environ.get("ALPACA_PHASE4_SECRET_KEY")
+                    or os.environ.get("ALPACA_SECRET_KEY", ""))
 TELEGRAM_TOKEN   = os.environ.get("TELEGRAM_TOKEN", "")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
 DATABASE_URL     = os.environ.get("DATABASE_URL", "")
@@ -84,9 +88,22 @@ IS_PAPER         = os.environ.get("ALPACA_PHASE4_PAPER", "false").lower() == "tr
 CENTRAL  = ZoneInfo("America/Chicago")
 BOT_NAME = "PHASE4"
 
-# ── Alpaca clients ────────────────────────────────────────────────────────────
-trading_client    = TradingClient(ALPACA_API_KEY, ALPACA_SECRET, paper=IS_PAPER)
-stock_data_client = StockHistoricalDataClient(ALPACA_API_KEY, ALPACA_SECRET)
+# Alpaca clients -- deferred init so missing keys give a clear error in logs
+trading_client    = None
+stock_data_client = None
+
+def _init_alpaca_clients():
+    global trading_client, stock_data_client
+    print(f"[PHASE4] Auth check: API key={'SET ('+ALPACA_API_KEY[:6]+')' if ALPACA_API_KEY else 'EMPTY — set ALPACA_PHASE4_API_KEY or ALPACA_API_KEY in Railway'}", flush=True)
+    print(f"[PHASE4] Auth check: Secret={'SET' if ALPACA_SECRET else 'EMPTY — set ALPACA_PHASE4_SECRET_KEY or ALPACA_SECRET_KEY in Railway'}", flush=True)
+    if not ALPACA_API_KEY or not ALPACA_SECRET:
+        raise RuntimeError(
+            "Phase4 needs Alpaca credentials. Add ALPACA_PHASE4_API_KEY and "
+            "ALPACA_PHASE4_SECRET_KEY to the Railway nexus-phase4 service variables."
+        )
+    trading_client    = TradingClient(ALPACA_API_KEY, ALPACA_SECRET, paper=IS_PAPER)
+    stock_data_client = StockHistoricalDataClient(ALPACA_API_KEY, ALPACA_SECRET)
+    print(f"[PHASE4] Alpaca clients ready (paper={IS_PAPER})", flush=True)
 
 # All symbols we need to fetch -- batched in single API calls
 ALL_ETFS        = ["NUGT", "SOXL", "LABU", "TQQQ", "DUST", "SOXS", "LABD", "SQQQ"]
@@ -1759,9 +1776,8 @@ def run():
     print("[PHASE4] V2.0: ADX regime filter | Vol confirmation | Underlying exit | Daily limits",
           flush=True)
 
-    if not ALPACA_API_KEY or not ALPACA_SECRET:
-        print("[PHASE4] 🔴 ALPACA_PHASE4_API_KEY / ALPACA_PHASE4_SECRET_KEY not set!", flush=True)
-        print("[PHASE4] Set these in Railway env vars for nexus-phase4 service", flush=True)
+    # Initialize Alpaca clients -- will print key diagnostics and crash clearly if keys missing
+    _init_alpaca_clients()
 
     if DATABASE_URL and _db_available:
         _phase4_memory = Phase4Memory(DATABASE_URL)
