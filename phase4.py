@@ -74,13 +74,9 @@ try:
 except ImportError:
     _db_available = False
 
-from webull.core.client import ApiClient
-from webull.trade.trade_client import TradeClient
+
 
 # ── Env ───────────────────────────────────────────────────────────────────────
-APP_KEY          = os.environ.get("WEBULL_APP_KEY")
-APP_SECRET       = os.environ.get("WEBULL_APP_SECRET")
-ACCOUNT_ID       = os.environ.get("WEBULL_ACCOUNT_ID")
 TELEGRAM_TOKEN   = os.environ.get("TELEGRAM_TOKEN")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
 DATABASE_URL     = os.environ.get("DATABASE_URL", "")
@@ -88,7 +84,7 @@ ANALYST_URL      = os.environ.get("ANALYST_URL", "").rstrip("/")
 NEXUS_TOKEN      = os.environ.get("NEXUS_INTERNAL_TOKEN", "")
 SQQQ_ENABLED     = os.environ.get("PHASE4_SQQQ_ENABLED", "false").lower() == "true"
 
-# Alpaca credentials (same vars as main.py)
+# Alpaca credentials
 ALPACA_API_KEY    = os.environ.get("APCA_API_KEY_ID", "")
 ALPACA_API_SECRET = os.environ.get("APCA_API_SECRET_KEY", "")
 
@@ -271,9 +267,7 @@ LOOP_INTERVAL        = 12
 WARMUP_BARS          = 40
 
 # ── Webull client ─────────────────────────────────────────────────────────────
-api_client   = ApiClient(APP_KEY, APP_SECRET, "us")
-trade_client = TradeClient(api_client)
-_order_lock  = threading.Lock()
+_order_lock     = threading.Lock()
 _balance_lock   = threading.Lock()
 _positions_lock = threading.Lock()
 
@@ -546,106 +540,36 @@ def get_current_price(symbol: str) -> float | None:
     except Exception:
         return None
 
+# ── Broker stubs (V1.8 Webull layer — replaced by Alpaca in deployed V2.0) ────
+# These functions exist in V1.8 source but are overridden in the deployed V2.0
+# phase4.py which has a full Alpaca broker implementation. Stubbed here so the
+# V1.8 source doesn't crash on import while the data-feed fix (Alpaca bars) is
+# what we actually needed from this file.
+
+ACCOUNT_ID = os.environ.get("WEBULL_ACCOUNT_ID", "")
+
 def get_account_id() -> str:
-    if ACCOUNT_ID:
-        return ACCOUNT_ID
-    try:
-        res = trade_client.account_v2.get_account_list()
-        if res.status_code == 200:
-            accounts = res.json()
-            if accounts:
-                return accounts[0].get("account_id", "")
-    except Exception:
-        pass
-    return ""
+    return ACCOUNT_ID
 
 _balance_cache      = {}
 _balance_cache_time = 0.0
 
 def get_buying_power(acct_id: str) -> float:
-    global _balance_cache, _balance_cache_time
-    now = time.time()
-    with _balance_lock:
-        if now - _balance_cache_time < WEBULL_CACHE_TTL and _balance_cache:
-            bp = float(_balance_cache.get("buying_power", 0))
-            return bp or float(_balance_cache.get("option_buying_power", 0))
-    try:
-        res = trade_client.account_v2.get_account_balance(acct_id)
-        if res.status_code == 200:
-            for asset in res.json().get("account_currency_assets", []):
-                if asset.get("currency") == "USD":
-                    with _balance_lock:
-                        _balance_cache      = asset
-                        _balance_cache_time = now
-                    bp = float(asset.get("buying_power", 0))
-                    return bp or float(asset.get("option_buying_power", 0))
-        elif res.status_code == 429:
-            time.sleep(WEBULL_429_BACKOFF)
-    except Exception:
-        pass
-    with _balance_lock:
-        bp = float(_balance_cache.get("buying_power", 0))
-        return bp or float(_balance_cache.get("option_buying_power", 0))
+    return 0.0
 
 _positions_cache      = {}
 _positions_cache_time = 0.0
 
 def get_all_positions(acct_id: str) -> dict:
-    global _positions_cache, _positions_cache_time
-    now = time.time()
-    with _positions_lock:
-        if now - _positions_cache_time < WEBULL_CACHE_TTL and _positions_cache is not None:
-            return dict(_positions_cache)
-    try:
-        res = trade_client.account_v2.get_account_position(acct_id)
-        if res.status_code == 200:
-            data  = res.json()
-            items = data if isinstance(data, list) else data.get("items", [])
-            result = {}
-            for item in items:
-                sym = item.get("ticker", {}).get("symbol", "") or item.get("symbol", "")
-                if sym:
-                    result[sym] = item
-            with _positions_lock:
-                _positions_cache      = result
-                _positions_cache_time = now
-            return result
-        elif res.status_code == 429:
-            time.sleep(WEBULL_429_BACKOFF)
-    except Exception:
-        pass
-    with _positions_lock:
-        return dict(_positions_cache) if _positions_cache else {}
+    return {}
 
 def invalidate_pos_cache():
-    global _positions_cache_time
-    with _positions_lock:
-        _positions_cache_time = 0.0
+    pass
 
 def place_order(symbol: str, side: str, qty: int, acct_id: str) -> bool:
-    with _order_lock:
-        try:
-            order = {
-                "client_order_id":         uuid.uuid4().hex,
-                "combo_type":              "NORMAL",
-                "symbol":                  symbol,
-                "instrument_type":         "EQUITY",
-                "market":                  "US",
-                "side":                    side,
-                "order_type":              "MARKET",
-                "time_in_force":           "DAY",
-                "quantity":                str(qty),
-                "support_trading_session": "CORE",
-                "entrust_type":            "QTY",
-            }
-            res = trade_client.order_v2.place_order(account_id=acct_id, new_orders=[order])
-            if res.status_code == 200:
-                return True
-            print(f"[ORDER ERR] {symbol} {side}: {res.status_code} {res.text[:200]}", flush=True)
-            return False
-        except Exception as e:
-            print(f"[ORDER ERR] {symbol} {side}: {e}", flush=True)
-            return False
+    return False
+
+
 
 # ── Context refresh thread ────────────────────────────────────────────────────
 def refresh_context_data():
