@@ -1,8 +1,7 @@
-webull-openapi-python-sdk
-yfinance
+alpaca-py
 pandas==2.2.2
 requests
 tzdata==2024.1
 flask
 psycopg2-binary
-
+ 
