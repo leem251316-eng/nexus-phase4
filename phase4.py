@@ -1,5 +1,5 @@
 """
-NEXUS PHASE 4 — PER-SYMBOL AUTONOMOUS BOTS V2.0
+NEXUS PHASE 4 — PER-SYMBOL AUTONOMOUS BOTS V2.1
 4 dedicated bots: NUGT, SOXL, LABU, TQQQ
 Each reads full market context, selects a trading mode, executes independently.
 
@@ -13,6 +13,21 @@ Bear pairs: each bot monitors bull RSI exhaustion -> flips to bear ETF on revers
 
 Capital allocation (by EV from nexus_analyzer 2yr + 1yr backtest):
   NUGT 30% | SOXL 25% | LABU 25% | TQQQ 20%
+
+V2.1 — Exit priority fix (Jun 30 2026):
+  rsi-overbought was checked BEFORE the profit ratchet. On a mean-reversion
+  entry (buy oversold, RSI climbs toward overbought as the thesis plays out),
+  that ordering let rsi-overbought cut almost every winner the instant profit
+  ticked positive -- before the position ever reached early_ratchet.
+  Backtest evidence (phase4_backtester.py V1.2, 2yr replay): 298/321 wins
+  (93%) were rsi-overbought exits averaging ~+0.24%, while the 61 stop-losses
+  averaged ~-1.7% (atr_stop) -- a ~7:1 win/loss size mismatch that made a
+  73% WR system net PnL-negative (avg -0.031%/trade) in both training and
+  out-of-sample. Ratchet is now checked first; rsi-overbought is the fallback
+  for trades that hit RSI=70 without yet clearing early_ratchet -- i.e. take
+  the small win/scratch now rather than risk it reversing to red. No change
+  to stop-loss priority (still checked first, unconditionally) or to any
+  entry-side logic, sizing, or gating.
 
 V2.0 — Full Alpaca migration (Jun 29 2026):
   Webull broker layer completely removed.
@@ -1431,11 +1446,19 @@ class SymbolBot:
                         if profit_pct <= -sl:
                             self.try_sell("stop-loss", profit_pct)
                     else:
+                        # V2.1 FIX (Jun 30 2026): ratchet now checked BEFORE
+                        # rsi-overbought. See module docstring for the full
+                        # rationale and backtest evidence -- in short, the old
+                        # order let rsi-overbought cut nearly every winner the
+                        # instant profit ticked positive (mean-reversion
+                        # entries naturally push RSI toward overbought as the
+                        # thesis plays out), so winners almost never reached
+                        # early_ratchet. 93% of wins were rsi-overbought exits
+                        # averaging ~+0.24%, against stop-losses averaging
+                        # ~-1.7% -- a ~7:1 mismatch that made a 73% WR system
+                        # net PnL-negative. Stop-loss priority is unchanged.
                         if profit_pct <= -sl:
                             self.try_sell("stop-loss", profit_pct)
-                        elif active_ctx.get("rsi", 50) >= RSI_OVERBOUGHT_EXIT and profit_pct > 0:
-                            log(self.symbol, f"🔄 RSI REVERSAL EXIT: RSI={active_ctx['rsi']:.0f}")
-                            self.try_sell("rsi-overbought", profit_pct)
                         elif profit_pct >= early_r:
                             rsi_now  = active_ctx.get("rsi", 50)
                             obv_flat = not active_ctx.get("obv_rising") and not active_ctx.get("obv_falling")
@@ -1446,6 +1469,9 @@ class SymbolBot:
                             if drawdown >= trail:
                                 reason = "trail-tight" if self._late_ratchet_active else "trail"
                                 self.try_sell(reason, profit_pct)
+                        elif active_ctx.get("rsi", 50) >= RSI_OVERBOUGHT_EXIT and profit_pct > 0:
+                            log(self.symbol, f"🔄 RSI REVERSAL EXIT: RSI={active_ctx['rsi']:.0f}")
+                            self.try_sell("rsi-overbought", profit_pct)
                         elif (self.mode == "EXTENDED" and self.active_sym == self.symbol and
                               profit_pct > -0.005 and not active_ctx.get("higher_lows", True)):
                             log(self.symbol, "📉 EXTENDED: trend break")
@@ -1484,11 +1510,11 @@ class SymbolBot:
 # ── Phase4 Service ────────────────────────────────────────────────────────────
 def run():
     global _phase4_memory
-    print("[PHASE4] NEXUS PHASE 4 V2.0 STARTING — Alpaca Edition", flush=True)
+    print("[PHASE4] NEXUS PHASE 4 V2.1 STARTING — Alpaca Edition", flush=True)
     print("[PHASE4] Broker: Alpaca | Fractional shares | Real-time IEX feed", flush=True)
     print(f"[PHASE4] Bots: NUGT(30%) | SOXL(25%) | LABU(25%) | TQQQ(20%)", flush=True)
     print(f"[PHASE4] Bear pairs: DUST | SOXS | LABD" + (" | SQQQ" if SQQQ_ENABLED else " | SQQQ(DISABLED)"), flush=True)
-    print(f"[PHASE4] V2.0: ADX regime filter | Vol confirmation | Underlying exit | Daily limits", flush=True)
+    print(f"[PHASE4] V2.1: Exit priority fix | ADX regime filter | Vol confirmation | Underlying exit | Daily limits", flush=True)
 
     # Auth check
     print(f"[PHASE4] Auth check: API key={'SET (' + ALPACA_API_KEY[:6] + ')' if ALPACA_API_KEY else 'MISSING'}", flush=True)
@@ -1542,11 +1568,11 @@ def run():
 
     vix_now = get_vix()
     alert(
-        f"⚡ PHASE4 V2.0 ONLINE — Alpaca Edition\n"
+        f"⚡ PHASE4 V2.1 ONLINE — Alpaca Edition\n"
         f"SOXL(SMH) TQQQ(QQQ) NUGT(GDX) LABU(XBI)\n"
         f"VIX: {vix_now:.1f} | SQQQ: {'ON' if SQQQ_ENABLED else 'OFF'}\n"
         f"Analyst: {'✅' if ANALYST_URL else '⚠ disabled'}\n"
-        f"V2.0: Full Alpaca migration — Webull removed"
+        f"V2.1: Exit priority fix — ratchet before rsi-overbought"
     )
     print("[PHASE4] All bots running.", flush=True)
 
