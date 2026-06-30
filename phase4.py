@@ -1,5 +1,5 @@
 """
-NEXUS PHASE 4 — PER-SYMBOL AUTONOMOUS BOTS V2.1
+NEXUS PHASE 4 — PER-SYMBOL AUTONOMOUS BOTS V2.2
 4 dedicated bots: NUGT, SOXL, LABU, TQQQ
 Each reads full market context, selects a trading mode, executes independently.
 
@@ -13,6 +13,21 @@ Bear pairs: each bot monitors bull RSI exhaustion -> flips to bear ETF on revers
 
 Capital allocation (by EV from nexus_analyzer 2yr + 1yr backtest):
   NUGT 30% | SOXL 25% | LABU 25% | TQQQ 20%
+
+V2.2 — Cross-service capital coordination (Jun 30 2026):
+  Confirmed: Phase4 and Berserker (main.py, separate Railway service/process,
+  nexus-commander/rare-perception) trade against the SAME live Alpaca account
+  -- one account was ever created; paper trading was layered on top of it,
+  never a second account. Each service was independently calling Alpaca's
+  buying_power and sizing trades with zero knowledge of the other's
+  outstanding orders. Added capital_coordinator.py, coordinating through
+  Postgres (both services already share DATABASE_URL). try_buy() now clamps
+  trade_size against get_available() before sizing, reserves immediately
+  before order submission, releases in a finally block immediately after --
+  whether the order succeeds or fails. Fails open throughout: any DB/
+  connection problem falls back to raw buying_power, uncoordinated, exactly
+  the pre-V2.2 behavior, rather than blocking a trade. Identical fix applied
+  to main.py (V10.25).
 
 V2.1 — Exit priority fix (Jun 30 2026):
   rsi-overbought was checked BEFORE the profit ratchet. On a mean-reversion
@@ -52,6 +67,8 @@ import pandas as pd
 import numpy as np
 from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
+
+from capital_coordinator import CapitalCoordinator, NO_COORDINATION
 
 try:
     from alpaca.trading.client import TradingClient
@@ -283,6 +300,7 @@ _analyst_scores_ts:    float = 0.0
 _analyst_scores_ttl:   float = 20.0
 _analyst_lock                = threading.Lock()
 _phase4_memory = None
+_capital_coordinator = None  # CapitalCoordinator -- initialized in run(), see capital_coordinator.py
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 def log(symbol, msg):
@@ -1253,6 +1271,23 @@ class SymbolBot:
         if trade_size < 1.00:
             return False
 
+        # V2.2: Cross-service capital coordination -- Berserker (main.py)
+        # trades against this SAME Alpaca account from a separate process.
+        # Clamp our intended spend against what's actually available once
+        # Berserker's outstanding reservations (if any) are accounted for.
+        # Fails open: if the coordinator can't reach the DB, available falls
+        # back to bp (raw buying power) unchanged.
+        if _capital_coordinator:
+            available = _capital_coordinator.get_available(bp)
+            if trade_size > available:
+                if available < 1.00:
+                    log(self.symbol, f"💰 CAPITAL COORD: ${available:.2f} available "
+                        f"(Berserker holding the rest) — skipping {sym}")
+                    return False
+                log(self.symbol, f"💰 CAPITAL COORD: trimmed ${trade_size:.2f} -> "
+                    f"${available:.2f} (Berserker reservation active)")
+                trade_size = round(available, 2)
+
         price = prices[-1] if prices else get_current_price(sym)
         if not price or price <= 0:
             return False
@@ -1264,7 +1299,16 @@ class SymbolBot:
             f"RSI={sym_ctx['rsi']:.1f} | size_mult={size_mult:.0%} | "
             f"analyst={analyst_score}{boost_label}{tide_label}")
 
-        success = place_order(sym, "BUY", trade_size)
+        # V2.2: Reserve against the shared account immediately before
+        # submitting, release immediately after -- closes the race window
+        # where Berserker (separate process, same Alpaca account) could read
+        # stale buying_power between now and Alpaca settling this order.
+        _res_id = _capital_coordinator.reserve(trade_size, symbol=sym) if _capital_coordinator else None
+        try:
+            success = place_order(sym, "BUY", trade_size)
+        finally:
+            if _capital_coordinator:
+                _capital_coordinator.release(_res_id)
         if success:
             import secrets
             self.in_position           = True
@@ -1509,12 +1553,12 @@ class SymbolBot:
 
 # ── Phase4 Service ────────────────────────────────────────────────────────────
 def run():
-    global _phase4_memory
-    print("[PHASE4] NEXUS PHASE 4 V2.1 STARTING — Alpaca Edition", flush=True)
+    global _phase4_memory, _capital_coordinator
+    print("[PHASE4] NEXUS PHASE 4 V2.2 STARTING — Alpaca Edition", flush=True)
     print("[PHASE4] Broker: Alpaca | Fractional shares | Real-time IEX feed", flush=True)
     print(f"[PHASE4] Bots: NUGT(30%) | SOXL(25%) | LABU(25%) | TQQQ(20%)", flush=True)
     print(f"[PHASE4] Bear pairs: DUST | SOXS | LABD" + (" | SQQQ" if SQQQ_ENABLED else " | SQQQ(DISABLED)"), flush=True)
-    print(f"[PHASE4] V2.1: Exit priority fix | ADX regime filter | Vol confirmation | Underlying exit | Daily limits", flush=True)
+    print(f"[PHASE4] V2.2: Capital coordination | Exit priority fix | ADX regime filter | Vol confirmation | Underlying exit | Daily limits", flush=True)
 
     # Auth check
     print(f"[PHASE4] Auth check: API key={'SET (' + ALPACA_API_KEY[:6] + ')' if ALPACA_API_KEY else 'MISSING'}", flush=True)
@@ -1529,6 +1573,12 @@ def run():
     else:
         _phase4_memory = Phase4Memory("")
         print("[PHASE4] Pattern memory: disabled (no DATABASE_URL)", flush=True)
+
+    # V2.2: Capital coordinator -- Phase4 trades against the SAME live Alpaca
+    # account as Berserker (main.py, separate Railway service/process) with
+    # zero prior coordination. See capital_coordinator.py for full rationale.
+    _capital_coordinator = CapitalCoordinator(DATABASE_URL, service_name="phase4")
+    _capital_coordinator.init_table()
 
     # Verify Alpaca account
     if _trade_client:
@@ -1568,10 +1618,11 @@ def run():
 
     vix_now = get_vix()
     alert(
-        f"⚡ PHASE4 V2.1 ONLINE — Alpaca Edition\n"
+        f"⚡ PHASE4 V2.2 ONLINE — Alpaca Edition\n"
         f"SOXL(SMH) TQQQ(QQQ) NUGT(GDX) LABU(XBI)\n"
         f"VIX: {vix_now:.1f} | SQQQ: {'ON' if SQQQ_ENABLED else 'OFF'}\n"
         f"Analyst: {'✅' if ANALYST_URL else '⚠ disabled'}\n"
+        f"V2.2: Capital coordination (shared Alpaca account w/ Berserker)\n"
         f"V2.1: Exit priority fix — ratchet before rsi-overbought"
     )
     print("[PHASE4] All bots running.", flush=True)
