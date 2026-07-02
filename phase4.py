@@ -571,6 +571,43 @@ def check_higher_lows(prices: list, lookback: int = 20) -> bool:
               if recent[i] <= recent[i-1] and recent[i] <= recent[i+1]]
     return len(lows) >= 2 and lows[-1] > lows[-2]
 
+# V2.3: ADX regime filter + volume confirmation. Was claimed live in the
+# V2.2 boot log ("ADX regime filter | Vol confirmation") but never actually
+# implemented -- only existed in phase4_backtester.py, which is what the
+# 298/321-win backtest evidence cited in this file's header was measuring.
+# Ported directly from phase4_backtester.py's compute_adx/
+# check_volume_confirmation, unchanged, so live finally matches what was
+# already backtested instead of drifting from it.
+ADX_TREND        = 20.0     # ADX < 20 = ranging = SCALP only
+VOL_CONFIRM_MULT = 1.2      # volume gate
+
+def compute_adx(prices: list, period: int = 14) -> float:
+    if len(prices) < period * 2 + 5:
+        return 25.0
+    try:
+        s      = pd.Series(prices)
+        pos_dm = s.diff().clip(lower=0)
+        neg_dm = (-s.diff()).clip(lower=0)
+        tr     = s.diff().abs()
+        atr_s  = tr.ewm(alpha=1.0 / period, adjust=False).mean()
+        pdm_s  = pos_dm.ewm(alpha=1.0 / period, adjust=False).mean()
+        ndm_s  = neg_dm.ewm(alpha=1.0 / period, adjust=False).mean()
+        pdi    = 100 * pdm_s / atr_s.replace(0, float("nan"))
+        ndi    = 100 * ndm_s / atr_s.replace(0, float("nan"))
+        dx     = 100 * (pdi - ndi).abs() / (pdi + ndi).replace(0, float("nan"))
+        adx    = dx.ewm(alpha=1.0 / period, adjust=False).mean()
+        val    = float(adx.iloc[-1])
+        return round(val, 2) if not (pd.isna(val) or val < 0) else 25.0
+    except Exception:
+        return 25.0
+
+def check_volume_confirmation(volumes: list, lookback: int = 10) -> bool:
+    if len(volumes) < lookback + 1:
+        return True
+    recent_vol = volumes[-1]
+    avg_vol    = sum(volumes[-lookback-1:-1]) / lookback
+    return avg_vol <= 0 or recent_vol >= avg_vol * VOL_CONFIRM_MULT
+
 # ── Context refresh thread ────────────────────────────────────────────────────
 def refresh_context_data():
     all_underlyings = ["SMH", "GDX", "XBI", "QQQ", "^VIX"]
@@ -1052,6 +1089,7 @@ class SymbolBot:
                 "cci": {}, "cci_oversold": False,
                 "rsi_lt40": False, "rsi_lt25": False,
                 "rsi14_lt35": False, "rsi14_lt20": False, "rsi21_lt45": False,
+                "vol_confirmed": True, "adx": 25.0,
             }
         rsi7   = compute_rsi(prices, 7)  or 50
         rsi14  = compute_rsi(prices, 14) or 50
@@ -1070,6 +1108,8 @@ class SymbolBot:
         obv      = compute_obv(prices, volumes) if volumes else {"rising": False, "obv_slope": 0}
         williams = compute_williams_r(prices)
         cci      = compute_cci(prices)
+        adx      = compute_adx(prices)
+        vol_ok   = check_volume_confirmation(volumes) if volumes else True
         return {
             "rsi": rsi7, "rsi14": rsi14, "rsi21": rsi21,
             "ma20": ma20, "above_ma20": above_ma20, "below_ma20": not above_ma20,
@@ -1089,6 +1129,7 @@ class SymbolBot:
             "rsi_lt40":   rsi7  < 40, "rsi_lt25":   rsi7  < 25,
             "rsi14_lt35": rsi14 < 35, "rsi14_lt20": rsi14 < 20,
             "rsi21_lt45": rsi21 < 45,
+            "vol_confirmed": vol_ok, "adx": adx,
         }
 
     def compute_entry_score(self, sym: str, sym_ctx: dict) -> int:
@@ -1109,6 +1150,10 @@ class SymbolBot:
         return max(0, score)
 
     def select_mode(self, spy_ctx: dict, sym_ctx: dict) -> str:
+        # V2.3: ranging market (ADX < 20) forces SCALP regardless of SPY
+        # context -- checked first, matching phase4_backtester.py's order.
+        if sym_ctx.get("adx", 25.0) < ADX_TREND:
+            return "SCALP"
         if spy_ctx.get("overbought"):
             return "SCALP"
         if (spy_ctx.get("strong") and sym_ctx.get("trend_10bar", 0) > 0.3 and
@@ -1149,6 +1194,8 @@ class SymbolBot:
             return False, 0, "no_bounce"
         if underlying_ctx.get("available") and underlying_ctx.get("tide_bearish"):
             return False, 0, "tide_bearish"
+        if not sym_ctx.get("vol_confirmed", True):
+            return False, 0, "vol_not_confirmed"
         score  = self.compute_entry_score(self.symbol, sym_ctx)
         min_sc = self.cfg["min_score"]
         if score < min_sc:
@@ -1215,6 +1262,8 @@ class SymbolBot:
                 bear_min   = BEAR_RECIPES.get(self.bear_pair, {}).get("min_score", 4)
                 bear_score = self.compute_entry_score(self.bear_pair, bear_ctx)
                 if bear_score < bear_min:
+                    return False, 0
+                if not bear_ctx.get("vol_confirmed", True):
                     return False, 0
                 quality = self.score_reversal_quality(bull_rsi, drop, bear_ctx)
                 if quality == 0:
@@ -1558,7 +1607,7 @@ def run():
     print("[PHASE4] Broker: Alpaca | Fractional shares | Real-time IEX feed", flush=True)
     print(f"[PHASE4] Bots: NUGT(30%) | SOXL(25%) | LABU(25%) | TQQQ(20%)", flush=True)
     print(f"[PHASE4] Bear pairs: DUST | SOXS | LABD" + (" | SQQQ" if SQQQ_ENABLED else " | SQQQ(DISABLED)"), flush=True)
-    print(f"[PHASE4] V2.2: Capital coordination | Exit priority fix | ADX regime filter | Vol confirmation | Underlying exit | Daily limits", flush=True)
+    print(f"[PHASE4] V2.3: Capital coordination | Exit priority fix | ADX regime filter (live) | Vol confirmation (live) | Underlying exit | Daily limits tracked (not yet enforced)", flush=True)
 
     # Auth check
     print(f"[PHASE4] Auth check: API key={'SET (' + ALPACA_API_KEY[:6] + ')' if ALPACA_API_KEY else 'MISSING'}", flush=True)
