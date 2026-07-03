@@ -1,5 +1,5 @@
 """
-NEXUS PHASE 4 — PER-SYMBOL AUTONOMOUS BOTS V2.5
+NEXUS PHASE 4 — PER-SYMBOL AUTONOMOUS BOTS V2.6
 4 dedicated bots: NUGT, SOXL, LABU, TQQQ
 Each reads full market context, selects a trading mode, executes independently.
 
@@ -399,7 +399,7 @@ class Phase4WinFollower:
             wr  = (sum(1 for w, _ in trades if w) / n) if n else 0.0
             pnl = sum(p for _, p in trades)
             stats[bot] = {"trades": n, "wr": round(wr, 3),
-                          "pnl_sum": round(pnl * 100, 2)}
+                          "pnl_sum": round(pnl, 2)}   # V2.6: DB stores percent already
             base = cfg["budget_pct"]
             if n >= WF_MIN_TRADES:
                 # WR 70% -> +8pts, WR 30% -> -8pts, linear between, clamped
@@ -1765,7 +1765,7 @@ class SymbolBot:
 # ── Phase4 Service ────────────────────────────────────────────────────────────
 def run():
     global _phase4_memory, _capital_coordinator, _win_follower
-    print("[PHASE4] NEXUS PHASE 4 V2.5 STARTING — Alpaca Edition", flush=True)
+    print("[PHASE4] NEXUS PHASE 4 V2.6 STARTING — Alpaca Edition", flush=True)
     print("[PHASE4] Broker: Alpaca | Fractional shares | Real-time IEX feed", flush=True)
     print(f"[PHASE4] Bots: NUGT(30%) | SOXL(25%) | LABU(25%) | TQQQ(20%) base — V2.4 reweights hourly by rolling WR", flush=True)
     print(f"[PHASE4] Bear pairs: DUST | SOXS | LABD" + (" | SQQQ" if SQQQ_ENABLED else " | SQQQ(DISABLED)"), flush=True)
@@ -1833,7 +1833,7 @@ def run():
 
     vix_now = get_vix()
     alert(
-        f"⚡ PHASE4 V2.5 ONLINE — Alpaca Edition\n"
+        f"⚡ PHASE4 V2.6 ONLINE — Alpaca Edition\n"
         f"Win Follower: budgets reweight hourly by 14d WR (±8pts, 10% floor)\n"
         f"SOXL(SMH) TQQQ(QQQ) NUGT(GDX) LABU(XBI)\n"
         f"VIX: {vix_now:.1f} | SQQQ: {'ON' if SQQQ_ENABLED else 'OFF'}\n"
