@@ -1,5 +1,5 @@
 """
-NEXUS PHASE 4 — PER-SYMBOL AUTONOMOUS BOTS V2.2
+NEXUS PHASE 4 — PER-SYMBOL AUTONOMOUS BOTS V2.4
 4 dedicated bots: NUGT, SOXL, LABU, TQQQ
 Each reads full market context, selects a trading mode, executes independently.
 
@@ -60,6 +60,7 @@ V1.6 — Complete entry/exit overhaul.
 
 import os
 import time
+import json
 import threading
 import traceback
 import requests
@@ -264,11 +265,6 @@ SIGNAL_COMBO_BOOST_SYMBOLS = {
 VIX_CAUTION  = 28.0
 VIX_PAUSE    = 35.0
 
-# V2.4: was tracked (self.daily_losses) since V2.x but never actually
-# checked anywhere -- a bad day for one bot had zero circuit breaker.
-# Matches Scanner's per-symbol convention (MAX_SYMBOL_LOSSES_PER_DAY = 3).
-MAX_DAILY_LOSSES_PER_BOT = 3
-
 REVERSAL_HIGH_RSI    = 75
 REVERSAL_HIGH_DROP   = 0.008
 REVERSAL_OB_RSI      = 70
@@ -306,6 +302,163 @@ _analyst_scores_ttl:   float = 20.0
 _analyst_lock                = threading.Lock()
 _phase4_memory = None
 _capital_coordinator = None  # CapitalCoordinator -- initialized in run(), see capital_coordinator.py
+
+# ==============================================================================
+# V2.4: PHASE4 WIN FOLLOWER -- performance-weighted budget reallocation.
+# Same follow-the-wins model as Berserker V10.29 / Scanner V2.8 / crypto V5.3,
+# adapted for Phase4's structure: instead of benching (each bot already has a
+# daily loss limit), the FIXED budget split (30/25/25/20) becomes DYNAMIC.
+# Every hour, each bot's rolling 14-day WR (bull + bear pair combined, from
+# phase4_trade_fingerprints) shifts its budget share up to +/-8pts, clamped
+# to [10%, 40%] and renormalized to 100%. Winners get more capital, losers
+# get less -- but every bot keeps >= 10% so it never stops generating the
+# data needed to earn its way back up. T-Bone alert whenever any bot's
+# weight moves >= 2pts from the last alerted state.
+# ==============================================================================
+WF_LOOKBACK_DAYS  = 14
+WF_REFRESH_SECS   = 3600
+WF_MIN_TRADES     = 5        # rolling trades needed before a bot's WR moves its weight
+WF_MAX_SHIFT      = 0.08     # max budget shift up or down from base
+WF_WEIGHT_FLOOR   = 0.10     # no bot ever below 10% -- keeps data flowing
+WF_WEIGHT_CEIL    = 0.40
+WF_ALERT_DELTA    = 0.02     # alert when any weight moves >= 2pts
+
+_win_follower = None   # Phase4WinFollower -- initialized in run()
+
+
+class Phase4WinFollower:
+    """V2.4: follow-the-wins budget allocator across the 4 bots."""
+
+    def __init__(self, db_url: str):
+        self.db_url        = db_url
+        self._conn         = None
+        self._lock         = threading.Lock()
+        self._enabled      = bool(db_url) and _db_available
+        self._weights      = {b: c["budget_pct"] for b, c in BOT_CONFIGS.items()}
+        self._stats        = {}
+        self._last_alerted = dict(self._weights)
+        self._last_refresh = 0.0
+        # bear ETF -> owning bot (DUST->NUGT etc.) so both sides of a bot's
+        # trades count toward the same performance record
+        self._sym_to_bot = {}
+        for bot, cfg in BOT_CONFIGS.items():
+            self._sym_to_bot[bot] = bot
+            self._sym_to_bot[cfg["bear_pair"]] = bot
+
+    def _get_conn(self):
+        if not self._enabled:
+            return None
+        try:
+            if self._conn is None or self._conn.closed:
+                self._conn = psycopg2.connect(self.db_url, connect_timeout=5)
+                self._conn.autocommit = False
+            else:
+                try:
+                    self._conn.rollback()
+                except Exception:
+                    self._conn = psycopg2.connect(self.db_url, connect_timeout=5)
+                    self._conn.autocommit = False
+            return self._conn
+        except Exception as e:
+            log("WF", f"DB connect error: {e}")
+            return None
+
+    def refresh(self):
+        if not self._enabled:
+            return
+        cutoff = int(time.time()) - WF_LOOKBACK_DAYS * 86400
+        try:
+            with self._lock:
+                conn = self._get_conn()
+                if not conn:
+                    return
+                with conn.cursor() as cur:
+                    cur.execute("""
+                        SELECT symbol, won, pnl_pct
+                        FROM phase4_trade_fingerprints
+                        WHERE won IS NOT NULL AND exit_ts >= %s
+                    """, (cutoff,))
+                    rows = cur.fetchall()
+                conn.commit()
+        except Exception as e:
+            log("WF", f"refresh query: {e}")
+            return
+
+        per_bot = {b: [] for b in BOT_CONFIGS}
+        for symbol, won, pnl in rows:
+            bot = self._sym_to_bot.get(symbol)
+            if bot:
+                per_bot[bot].append((bool(won), float(pnl or 0)))
+
+        raw = {}
+        stats = {}
+        for bot, cfg in BOT_CONFIGS.items():
+            trades = per_bot[bot]
+            n   = len(trades)
+            wr  = (sum(1 for w, _ in trades if w) / n) if n else 0.0
+            pnl = sum(p for _, p in trades)
+            stats[bot] = {"trades": n, "wr": round(wr, 3),
+                          "pnl_sum": round(pnl * 100, 2)}
+            base = cfg["budget_pct"]
+            if n >= WF_MIN_TRADES:
+                # WR 70% -> +8pts, WR 30% -> -8pts, linear between, clamped
+                shift = max(-WF_MAX_SHIFT, min(WF_MAX_SHIFT, (wr - 0.50) * 0.4))
+            else:
+                shift = 0.0   # not enough data -> base weight
+            raw[bot] = max(WF_WEIGHT_FLOOR, min(WF_WEIGHT_CEIL, base + shift))
+
+        total = sum(raw.values())
+        new_weights = {b: round(w / total, 4) for b, w in raw.items()}
+
+        changed = any(abs(new_weights[b] - self._last_alerted.get(b, 0)) >= WF_ALERT_DELTA
+                      for b in new_weights)
+        self._weights      = new_weights
+        self._stats        = stats
+        self._last_refresh = time.time()
+
+        wtxt = " | ".join(f"{b} {new_weights[b]*100:.0f}%" for b in BOT_CONFIGS)
+        log("WF", f"weights: {wtxt}")
+        if changed:
+            self._last_alerted = dict(new_weights)
+            lines = ["⚖️ WIN FOLLOWER [PHASE4] -- budgets reweighted"]
+            for b in BOT_CONFIGS:
+                s    = stats[b]
+                base = BOT_CONFIGS[b]["budget_pct"]
+                d    = (new_weights[b] - base) * 100
+                lines.append(f"{b}: {new_weights[b]*100:.0f}% ({d:+.0f} vs base) — "
+                             f"WR {s['wr']:.0%}/{s['trades']}t {s['pnl_sum']:+.1f}%")
+            lines.append(f"({WF_LOOKBACK_DAYS}d rolling | floor {WF_WEIGHT_FLOOR:.0%} "
+                         f"keeps every bot alive)")
+            alert("\n".join(lines))
+
+    def get_weight(self, bot_symbol: str, fallback: float) -> float:
+        """Budget share for this bot. Falls back to the static budget_pct
+        if disabled or not yet refreshed -- exact pre-V2.4 behavior."""
+        if not self._enabled or not self._last_refresh:
+            return fallback
+        return self._weights.get(bot_symbol, fallback)
+
+    def get_status(self) -> dict:
+        return {"weights": self._weights, "stats": self._stats,
+                "base": {b: c["budget_pct"] for b, c in BOT_CONFIGS.items()},
+                "last_refresh_min_ago": (round((time.time() - self._last_refresh) / 60, 1)
+                                         if self._last_refresh else None)}
+
+    def start_scheduler(self):
+        if not self._enabled:
+            log("WF", "disabled (no DATABASE_URL) -- static budget split")
+            return
+        def _run():
+            time.sleep(120)
+            while True:
+                try:
+                    self.refresh()
+                except Exception as e:
+                    log("WF", f"loop: {e}")
+                time.sleep(WF_REFRESH_SECS)
+        threading.Thread(target=_run, daemon=True, name="phase4-wf").start()
+        log("WF", f"scheduler started (refresh {WF_REFRESH_SECS//60}m, "
+                  f"lookback {WF_LOOKBACK_DAYS}d, shift ±{WF_MAX_SHIFT:.0%})")
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 def log(symbol, msg):
@@ -1282,23 +1435,11 @@ class SymbolBot:
 
     def try_buy(self, sym: str, prices: list, volumes: list,
                 spy_ctx: dict, sym_ctx: dict, reversal_quality: int = 0) -> bool:
-        # V2.4: per-bot daily loss limit -- tracked for a while, never
-        # actually enforced until now.
-        if self.daily_losses >= MAX_DAILY_LOSSES_PER_BOT:
-            log(self.symbol, f"🚫 DAILY LOSS LIMIT: {self.daily_losses} stops today — no more entries until reset")
-            return False
-        # V2.4: remote pause -- /buys off, /killswitch, /resume, and the
-        # new portfolio-wide daily loss check in main.py all reach here.
-        # Fails open: any import/connection issue and this never blocks
-        # a trade on its own.
-        try:
-            from phase4_server import get_buys_disabled
-            if get_buys_disabled():
-                return False
-        except Exception:
-            pass
         bp        = get_buying_power()
-        base_size = round(bp * self.budget_pct, 2)
+        # V2.4: Win Follower dynamic budget share -- falls back to the static
+        # budget_pct until the first refresh completes (or if DB unavailable)
+        _share    = _win_follower.get_weight(self.symbol, self.budget_pct) if _win_follower else self.budget_pct
+        base_size = round(bp * _share, 2)
         if base_size < 1.00:
             return False
 
@@ -1622,12 +1763,12 @@ class SymbolBot:
 
 # ── Phase4 Service ────────────────────────────────────────────────────────────
 def run():
-    global _phase4_memory, _capital_coordinator
+    global _phase4_memory, _capital_coordinator, _win_follower
     print("[PHASE4] NEXUS PHASE 4 V2.4 STARTING — Alpaca Edition", flush=True)
     print("[PHASE4] Broker: Alpaca | Fractional shares | Real-time IEX feed", flush=True)
-    print(f"[PHASE4] Bots: NUGT(30%) | SOXL(25%) | LABU(25%) | TQQQ(20%)", flush=True)
+    print(f"[PHASE4] Bots: NUGT(30%) | SOXL(25%) | LABU(25%) | TQQQ(20%) base — V2.4 reweights hourly by rolling WR", flush=True)
     print(f"[PHASE4] Bear pairs: DUST | SOXS | LABD" + (" | SQQQ" if SQQQ_ENABLED else " | SQQQ(DISABLED)"), flush=True)
-    print(f"[PHASE4] V2.4: Daily loss limit ENFORCED ({MAX_DAILY_LOSSES_PER_BOT}/bot/day) | Remote pause via /control | Capital coordination | Exit priority fix | ADX regime filter (live) | Vol confirmation (live) | Underlying exit", flush=True)
+    print(f"[PHASE4] V2.3: Capital coordination | Exit priority fix | ADX regime filter (live) | Vol confirmation (live) | Underlying exit | Daily limits tracked (not yet enforced)", flush=True)
 
     # Auth check
     print(f"[PHASE4] Auth check: API key={'SET (' + ALPACA_API_KEY[:6] + ')' if ALPACA_API_KEY else 'MISSING'}", flush=True)
@@ -1642,6 +1783,10 @@ def run():
     else:
         _phase4_memory = Phase4Memory("")
         print("[PHASE4] Pattern memory: disabled (no DATABASE_URL)", flush=True)
+
+    # V2.4: Win Follower budget allocator
+    _win_follower = Phase4WinFollower(DATABASE_URL if _db_available else "")
+    _win_follower.start_scheduler()
 
     # V2.2: Capital coordinator -- Phase4 trades against the SAME live Alpaca
     # account as Berserker (main.py, separate Railway service/process) with
@@ -1688,11 +1833,11 @@ def run():
     vix_now = get_vix()
     alert(
         f"⚡ PHASE4 V2.4 ONLINE — Alpaca Edition\n"
+        f"Win Follower: budgets reweight hourly by 14d WR (±8pts, 10% floor)\n"
         f"SOXL(SMH) TQQQ(QQQ) NUGT(GDX) LABU(XBI)\n"
         f"VIX: {vix_now:.1f} | SQQQ: {'ON' if SQQQ_ENABLED else 'OFF'}\n"
         f"Analyst: {'✅' if ANALYST_URL else '⚠ disabled'}\n"
-        f"V2.4: Daily loss limit enforced ({MAX_DAILY_LOSSES_PER_BOT}/bot/day) + remote pause (/control)\n"
-        f"V2.3: ADX regime filter + vol confirmation live\n"
+        f"V2.3: ADX regime filter + vol confirmation now live\n"
         f"V2.2: Capital coordination (shared Alpaca account w/ Berserker)\n"
         f"V2.1: Exit priority fix — ratchet before rsi-overbought"
     )
