@@ -1623,11 +1623,11 @@ class SymbolBot:
 # ── Phase4 Service ────────────────────────────────────────────────────────────
 def run():
     global _phase4_memory, _capital_coordinator
-    print("[PHASE4] NEXUS PHASE 4 V2.3 STARTING — Alpaca Edition", flush=True)
+    print("[PHASE4] NEXUS PHASE 4 V2.4 STARTING — Alpaca Edition", flush=True)
     print("[PHASE4] Broker: Alpaca | Fractional shares | Real-time IEX feed", flush=True)
     print(f"[PHASE4] Bots: NUGT(30%) | SOXL(25%) | LABU(25%) | TQQQ(20%)", flush=True)
     print(f"[PHASE4] Bear pairs: DUST | SOXS | LABD" + (" | SQQQ" if SQQQ_ENABLED else " | SQQQ(DISABLED)"), flush=True)
-    print(f"[PHASE4] V2.3: Capital coordination | Exit priority fix | ADX regime filter (live) | Vol confirmation (live) | Underlying exit | Daily limits tracked (not yet enforced)", flush=True)
+    print(f"[PHASE4] V2.4: Daily loss limit ENFORCED ({MAX_DAILY_LOSSES_PER_BOT}/bot/day) | Remote pause via /control | Capital coordination | Exit priority fix | ADX regime filter (live) | Vol confirmation (live) | Underlying exit", flush=True)
 
     # Auth check
     print(f"[PHASE4] Auth check: API key={'SET (' + ALPACA_API_KEY[:6] + ')' if ALPACA_API_KEY else 'MISSING'}", flush=True)
@@ -1687,11 +1687,12 @@ def run():
 
     vix_now = get_vix()
     alert(
-        f"⚡ PHASE4 V2.3 ONLINE — Alpaca Edition\n"
+        f"⚡ PHASE4 V2.4 ONLINE — Alpaca Edition\n"
         f"SOXL(SMH) TQQQ(QQQ) NUGT(GDX) LABU(XBI)\n"
         f"VIX: {vix_now:.1f} | SQQQ: {'ON' if SQQQ_ENABLED else 'OFF'}\n"
         f"Analyst: {'✅' if ANALYST_URL else '⚠ disabled'}\n"
-        f"V2.3: ADX regime filter + vol confirmation now live\n"
+        f"V2.4: Daily loss limit enforced ({MAX_DAILY_LOSSES_PER_BOT}/bot/day) + remote pause (/control)\n"
+        f"V2.3: ADX regime filter + vol confirmation live\n"
         f"V2.2: Capital coordination (shared Alpaca account w/ Berserker)\n"
         f"V2.1: Exit priority fix — ratchet before rsi-overbought"
     )
