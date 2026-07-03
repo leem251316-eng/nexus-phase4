@@ -95,7 +95,7 @@ def _bot_state_dict(bot) -> dict:
 def health():
     return jsonify({
         "ok":         True,
-        "version":    "phase4-v2.0",
+        "version":    "phase4-v2.4",
         "uptime_min": int((time.time() - _start_time) / 60),
     })
 
@@ -127,7 +127,7 @@ def think():
         now = datetime.now(tz=CENTRAL)
         return jsonify({
             "online":         True,
-            "version":        "V2.0",
+            "version":        "V2.4",
             "timestamp":      now.strftime("%H:%M:%S CDT"),
             "bots":           bots_dict,
             "buying_power":   buying_power,
@@ -166,5 +166,5 @@ def start_server(bots: list, port: int = None):
 
     t = threading.Thread(target=_run, daemon=True, name="Phase4FlaskServer")
     t.start()
-    print(f"[PHASE4-SERVER] ✅ /think endpoint live on port {port}", flush=True)
+    print(f"[PHASE4-SERVER] ✅ /think + /control endpoints live on port {port}", flush=True)
     return t
