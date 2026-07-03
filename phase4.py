@@ -264,6 +264,11 @@ SIGNAL_COMBO_BOOST_SYMBOLS = {
 VIX_CAUTION  = 28.0
 VIX_PAUSE    = 35.0
 
+# V2.4: was tracked (self.daily_losses) since V2.x but never actually
+# checked anywhere -- a bad day for one bot had zero circuit breaker.
+# Matches Scanner's per-symbol convention (MAX_SYMBOL_LOSSES_PER_DAY = 3).
+MAX_DAILY_LOSSES_PER_BOT = 3
+
 REVERSAL_HIGH_RSI    = 75
 REVERSAL_HIGH_DROP   = 0.008
 REVERSAL_OB_RSI      = 70
@@ -1277,6 +1282,21 @@ class SymbolBot:
 
     def try_buy(self, sym: str, prices: list, volumes: list,
                 spy_ctx: dict, sym_ctx: dict, reversal_quality: int = 0) -> bool:
+        # V2.4: per-bot daily loss limit -- tracked for a while, never
+        # actually enforced until now.
+        if self.daily_losses >= MAX_DAILY_LOSSES_PER_BOT:
+            log(self.symbol, f"🚫 DAILY LOSS LIMIT: {self.daily_losses} stops today — no more entries until reset")
+            return False
+        # V2.4: remote pause -- /buys off, /killswitch, /resume, and the
+        # new portfolio-wide daily loss check in main.py all reach here.
+        # Fails open: any import/connection issue and this never blocks
+        # a trade on its own.
+        try:
+            from phase4_server import get_buys_disabled
+            if get_buys_disabled():
+                return False
+        except Exception:
+            pass
         bp        = get_buying_power()
         base_size = round(bp * self.budget_pct, 2)
         if base_size < 1.00:
