@@ -10,12 +10,23 @@ import time
 import threading
 from datetime import datetime
 from zoneinfo import ZoneInfo
-from flask import Flask, jsonify
+from flask import Flask, jsonify, request
 
 CENTRAL     = ZoneInfo("America/Chicago")
 _flask_app  = Flask("phase4_server")
 _bots       = []
 _start_time = time.time()
+
+# V2.4: Phase4 previously had zero remote control surface -- /killswitch,
+# /buys off, and /pause PHASE4's own help text all claimed or implied this
+# was covered and none of them actually reached Phase4. Mirrors crypto.py's
+# /control pattern. Read via get_buys_disabled() (function, not the raw
+# module var) from phase4.py -- same convention scanner.py already uses
+# for cross-module reads of live state (get_effective_aggro_mult() etc.).
+_buys_disabled = False
+
+def get_buys_disabled() -> bool:
+    return _buys_disabled
 
 
 def _bot_state_dict(bot) -> dict:
@@ -115,15 +126,32 @@ def think():
 
         now = datetime.now(tz=CENTRAL)
         return jsonify({
-            "online":       True,
-            "version":      "V2.0",
-            "timestamp":    now.strftime("%H:%M:%S CDT"),
-            "bots":         bots_dict,
-            "buying_power": buying_power,
-            "total_value":  total_value,
+            "online":         True,
+            "version":        "V2.0",
+            "timestamp":      now.strftime("%H:%M:%S CDT"),
+            "bots":           bots_dict,
+            "buying_power":   buying_power,
+            "total_value":    total_value,
+            "buys_disabled":  _buys_disabled,   # V2.4
         })
     except Exception as e:
         return jsonify({"online": True, "error": str(e), "bots": {}}), 500
+
+
+@_flask_app.route("/control", methods=["POST"])
+def control():
+    """
+    V2.4: mirrors crypto.py's /control. Currently the only supported key
+    is buys_disabled -- pauses/resumes NEW entries only. Does not touch
+    open positions; each bot keeps managing its own exits regardless.
+    Called by main.py from /buys on|off, /resume, /killswitch, and the
+    new portfolio-wide daily loss check.
+    """
+    global _buys_disabled
+    data = request.get_json(silent=True) or {}
+    if "buys_disabled" in data:
+        _buys_disabled = bool(data["buys_disabled"])
+    return jsonify({"ok": True, "buys_disabled": _buys_disabled})
 
 
 def start_server(bots: list, port: int = None):
