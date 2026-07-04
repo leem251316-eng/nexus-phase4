@@ -1,5 +1,16 @@
 """
-NEXUS PHASE 4 — PER-SYMBOL AUTONOMOUS BOTS V2.6
+NEXUS PHASE 4 — PER-SYMBOL AUTONOMOUS BOTS V2.7
+
+V2.7 — Killswitch integration (Jul 4 2026):
+  - New per-bot kill_paused flag: blocks NEW entries (try_buy guard) while
+    exit management keeps running. Set/cleared via phase4_server V2.1's
+    new POST /close_all and POST /resume endpoints.
+  - main.py V10.35 /killswitch calls /close_all (set PHASE4_URL on the
+    Fleet Commander service to the Railway internal URL to arm it), and
+    /resume clears the pause. Closes the "Phase4: manual close required"
+    gap. /close_all closes ONLY the bots' tracked positions — Phase4
+    shares the Alpaca account with Berserker, so a blanket account close
+    from here would clobber Berserker's stocks.
 4 dedicated bots: NUGT, SOXL, LABU, TQQQ
 Each reads full market context, selects a trading mode, executes independently.
 
@@ -98,6 +109,12 @@ except ImportError:
 TELEGRAM_TOKEN    = os.environ.get("TELEGRAM_TOKEN")
 TELEGRAM_CHAT_ID  = os.environ.get("TELEGRAM_CHAT_ID")
 DATABASE_URL      = os.environ.get("DATABASE_URL", "")
+
+# V2.7: killswitch pause lives as a PER-BOT attribute (bot.kill_paused),
+# set/cleared by phase4_server V2.1's /close_all and /resume. Not a module
+# global: this file runs as __main__ while phase4_server does `import
+# phase4`, which creates a second module instance -- a global set there
+# would be invisible to the bots. Bot objects are shared by reference.
 ANALYST_URL       = os.environ.get("ANALYST_URL", "").rstrip("/")
 NEXUS_TOKEN       = os.environ.get("NEXUS_INTERNAL_TOKEN", "")
 SQQQ_ENABLED      = os.environ.get("PHASE4_SQQQ_ENABLED", "false").lower() == "true"
@@ -1436,6 +1453,15 @@ class SymbolBot:
 
     def try_buy(self, sym: str, prices: list, volumes: list,
                 spy_ctx: dict, sym_ctx: dict, reversal_quality: int = 0) -> bool:
+        # V2.7: killswitch pause -- phase4_server /close_all sets
+        # bot.kill_paused on every bot; /resume clears it. Per-bot attribute
+        # (NOT a module global) because this file runs as __main__ while the
+        # server does `import phase4` -- two separate module instances, so a
+        # module-level flag set by the server would never be seen here. The
+        # bot objects are shared by reference; attributes on them are the
+        # one reliable channel. Blocks NEW entries only; exits keep running.
+        if getattr(self, "kill_paused", False):
+            return False
         bp        = get_buying_power()
         # V2.4: Win Follower dynamic budget share -- falls back to the static
         # budget_pct until the first refresh completes (or if DB unavailable)
@@ -1765,7 +1791,7 @@ class SymbolBot:
 # ── Phase4 Service ────────────────────────────────────────────────────────────
 def run():
     global _phase4_memory, _capital_coordinator, _win_follower
-    print("[PHASE4] NEXUS PHASE 4 V2.6 STARTING — Alpaca Edition", flush=True)
+    print("[PHASE4] NEXUS PHASE 4 V2.7 STARTING — Alpaca Edition", flush=True)
     print("[PHASE4] Broker: Alpaca | Fractional shares | Real-time IEX feed", flush=True)
     print(f"[PHASE4] Bots: NUGT(30%) | SOXL(25%) | LABU(25%) | TQQQ(20%) base — V2.4 reweights hourly by rolling WR", flush=True)
     print(f"[PHASE4] Bear pairs: DUST | SOXS | LABD" + (" | SQQQ" if SQQQ_ENABLED else " | SQQQ(DISABLED)"), flush=True)
@@ -1833,7 +1859,7 @@ def run():
 
     vix_now = get_vix()
     alert(
-        f"⚡ PHASE4 V2.6 ONLINE — Alpaca Edition\n"
+        f"⚡ PHASE4 V2.7 ONLINE — Alpaca Edition\n"
         f"Win Follower: budgets reweight hourly by 14d WR (±8pts, 10% floor)\n"
         f"SOXL(SMH) TQQQ(QQQ) NUGT(GDX) LABU(XBI)\n"
         f"VIX: {vix_now:.1f} | SQQQ: {'ON' if SQQQ_ENABLED else 'OFF'}\n"
