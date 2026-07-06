@@ -1,5 +1,16 @@
 """
-NEXUS PHASE 4 — PER-SYMBOL AUTONOMOUS BOTS V2.7
+NEXUS PHASE 4 — PER-SYMBOL AUTONOMOUS BOTS V2.8
+
+V2.8 — Fill-anchored entries + true recovery times (Jul 6 2026):
+  ✅ Entry price now anchored to the ACTUAL Alpaca fill (brief poll after
+     submit), not the last 1-min bar. On 3x leveraged ETFs, intrabar moves
+     of 0.2-0.5% are routine -- stops, ratchets, MFE/MAE, and fingerprints
+     all key off entry_price, so the bar anchor was shifting every exit
+     level. Same fix class as Berserker V10.35. place_order() now returns
+     the order object (drop-in: callers only tested truthiness).
+  ✅ recover_position() recovers the real entry time from the last filled
+     BUY order -- the dwell-exit timer and hold stats were restarting on
+     every redeploy.
 
 V2.7 — Killswitch integration (Jul 4 2026):
   - New per-bot kill_paused flag: blocks NEW entries (try_buy guard) while
@@ -517,15 +528,18 @@ def get_all_positions() -> dict:
         print(f"[P4 BROKER] get_positions error: {e}", flush=True)
         return {}
 
-def place_order(symbol: str, side: str, notional: float) -> bool:
+def place_order(symbol: str, side: str, notional: float):
     """
     Place a notional market order via Alpaca.
     V2.0: Uses notional (dollar amount) instead of qty — supports fractional shares.
+    V2.8: Returns the submitted order object (truthy) so callers can poll
+    the actual fill price, or None on failure. All existing callers only
+    tested truthiness, so this is drop-in.
     side: 'BUY' or 'SELL'
     """
     if _trade_client is None:
         print(f"[P4 BROKER] No trade client — order skipped {symbol} {side}", flush=True)
-        return False
+        return None
     try:
         req = MarketOrderRequest(
             symbol=symbol,
@@ -533,11 +547,34 @@ def place_order(symbol: str, side: str, notional: float) -> bool:
             side=OrderSide.BUY if side == "BUY" else OrderSide.SELL,
             time_in_force=TimeInForce.DAY,
         )
-        _trade_client.submit_order(req)
-        return True
+        return _trade_client.submit_order(req)
     except Exception as e:
         print(f"[P4 BROKER] order error {symbol} {side} ${notional}: {e}", flush=True)
-        return False
+        return None
+
+
+def get_fill_price(order, retries: int = 3, delay: float = 1.0) -> float:
+    """
+    V2.8: Poll a submitted order briefly for its actual average fill price.
+    Returns 0.0 if unavailable (caller falls back to the bar price).
+    Mirrors Berserker's V10.35 fill-anchor fix -- on 3x leveraged ETFs,
+    intrabar moves of 0.2-0.5% are routine, so anchoring stops/ratchets/
+    fingerprints to the last 1-min bar instead of the fill materially
+    shifts every exit level.
+    """
+    try:
+        oid = str(getattr(order, "id", "") or "")
+        if not oid or _trade_client is None:
+            return 0.0
+        for _ in range(retries):
+            o = _trade_client.get_order_by_id(oid)
+            fap = getattr(o, "filled_avg_price", None) if o is not None else None
+            if fap:
+                return float(fap)
+            time.sleep(delay)
+    except Exception as e:
+        print(f"[P4 BROKER] fill poll failed: {e}", flush=True)
+    return 0.0
 
 def place_sell_all(symbol: str) -> bool:
     """Close entire position in symbol via Alpaca."""
@@ -1542,16 +1579,25 @@ class SymbolBot:
         # stale buying_power between now and Alpaca settling this order.
         _res_id = _capital_coordinator.reserve(trade_size, symbol=sym) if _capital_coordinator else None
         try:
-            success = place_order(sym, "BUY", trade_size)
+            _order  = place_order(sym, "BUY", trade_size)
+            success = _order is not None
         finally:
             if _capital_coordinator:
                 _capital_coordinator.release(_res_id)
         if success:
             import secrets
+            # V2.8: anchor to the ACTUAL fill, not the last 1-min bar --
+            # stops, ratchets, MFE/MAE, and the fingerprint all key off
+            # entry_price. Bar-price anchoring was the same disease
+            # Berserker fixed in V10.35.
+            _fill = get_fill_price(_order)
+            entry_anchor = _fill if _fill > 0 else price
+            if _fill > 0 and abs(_fill - price) / price > 0.001:
+                log(self.symbol, f"⚓ Fill anchor: bar=${price:.3f} -> fill=${_fill:.3f}")
             self.in_position           = True
             self.active_sym            = sym
-            self.entry_price           = price
-            self.peak_price            = price
+            self.entry_price           = entry_anchor
+            self.peak_price            = entry_anchor
             self.entry_time            = time.time()
             self.mfe                   = 0.0
             self.mae                   = 0.0
@@ -1567,13 +1613,13 @@ class SymbolBot:
             self._entry_tide           = tide_bullish
             self._entry_vix            = vix
             self._bear_ext_trailing    = False
-            self._bear_ext_peak        = price
+            self._bear_ext_peak        = entry_anchor
             self._late_ratchet_active  = False
 
             if _phase4_memory:
                 _phase4_memory.record_entry(
                     self.trade_id, self.symbol, self.bear_pair,
-                    is_bear, self.mode, price,
+                    is_bear, self.mode, entry_anchor,
                     self._entry_rsi, spy_ctx, qqq_ctx, sym_ctx,
                     analyst_score, signal_boost,
                     entry_score, reversal_quality, tide_bullish, vix
@@ -1640,7 +1686,26 @@ class SymbolBot:
                 self.entry_price = cost
                 self.peak_price  = max(cost, get_current_price(sym) or cost)
                 self.trade_id    = secrets.token_hex(8)
+                # V2.8: recover the REAL entry time from the last filled BUY
+                # order instead of resetting to now -- the dwell-exit timer
+                # and hold-time stats were restarting on every redeploy.
+                # Falls back to now if the order lookup fails.
                 self.entry_time  = time.time()
+                try:
+                    from alpaca.trading.requests import GetOrdersRequest
+                    from alpaca.trading.enums import QueryOrderStatus
+                    _req = GetOrdersRequest(status=QueryOrderStatus.CLOSED,
+                                            symbols=[sym], limit=10)
+                    for _o in (_trade_client.get_orders(filter=_req) or []):
+                        _side = str(getattr(_o, "side", "")).lower()
+                        _fat  = getattr(_o, "filled_at", None)
+                        if _side.endswith("buy") and _fat is not None:
+                            self.entry_time = _fat.timestamp()
+                            log(self.symbol, f"🕐 Recovered entry time: "
+                                f"{datetime.fromtimestamp(self.entry_time, tz=CENTRAL).strftime('%m/%d %I:%M %p')}")
+                            break
+                except Exception as _te:
+                    log(self.symbol, f"⚠ entry-time recovery failed ({_te}) -- using now")
                 self.mfe         = 0.0
                 self.mae         = 0.0
                 spy_ctx          = get_spy_context()
@@ -1791,7 +1856,7 @@ class SymbolBot:
 # ── Phase4 Service ────────────────────────────────────────────────────────────
 def run():
     global _phase4_memory, _capital_coordinator, _win_follower
-    print("[PHASE4] NEXUS PHASE 4 V2.7 STARTING — Alpaca Edition", flush=True)
+    print("[PHASE4] NEXUS PHASE 4 V2.8 STARTING — Alpaca Edition", flush=True)
     print("[PHASE4] Broker: Alpaca | Fractional shares | Real-time IEX feed", flush=True)
     print(f"[PHASE4] Bots: NUGT(30%) | SOXL(25%) | LABU(25%) | TQQQ(20%) base — V2.4 reweights hourly by rolling WR", flush=True)
     print(f"[PHASE4] Bear pairs: DUST | SOXS | LABD" + (" | SQQQ" if SQQQ_ENABLED else " | SQQQ(DISABLED)"), flush=True)
@@ -1859,7 +1924,7 @@ def run():
 
     vix_now = get_vix()
     alert(
-        f"⚡ PHASE4 V2.7 ONLINE — Alpaca Edition\n"
+        f"⚡ PHASE4 V2.8 ONLINE — Alpaca Edition\n"
         f"Win Follower: budgets reweight hourly by 14d WR (±8pts, 10% floor)\n"
         f"SOXL(SMH) TQQQ(QQQ) NUGT(GDX) LABU(XBI)\n"
         f"VIX: {vix_now:.1f} | SQQQ: {'ON' if SQQQ_ENABLED else 'OFF'}\n"
