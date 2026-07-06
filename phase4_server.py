@@ -1,5 +1,8 @@
 """
 phase4_server.py — Thin Flask control server for nexus-phase4.
+V2.2: TOKEN LOCKDOWN — all routes except /health require X-Nexus-Token
+      == NEXUS_INTERNAL_TOKEN. /close_all and /resume were publicly
+      reachable with zero auth. Fail-open only when the env var is unset.
 V2.0: Updated for Alpaca migration.
 - Removed: bot.prices, bot.bear_prices, bot.acct_id references
 - Uses: get_current_price(), get_buying_power(), get_all_positions() (no args)
@@ -10,12 +13,32 @@ import time
 import threading
 from datetime import datetime
 from zoneinfo import ZoneInfo
-from flask import Flask, jsonify
+from flask import Flask, jsonify, request
 
 CENTRAL     = ZoneInfo("America/Chicago")
 _flask_app  = Flask("phase4_server")
 _bots       = []
 _start_time = time.time()
+
+# V2.2: TOKEN LOCKDOWN. This server answers on a PUBLIC up.railway.app
+# domain and exposes POST /close_all (flattens every Phase4 position) and
+# POST /resume -- previously open to anyone who found the URL. Every
+# request except /health must carry X-Nexus-Token matching
+# NEXUS_INTERNAL_TOKEN. Fail-open ONLY if the env var is unset (loud boot
+# warning) so a missed variable degrades to pre-V2.2 behavior instead of
+# breaking the killswitch. Fleet Commander's nexus_client already sends
+# the header on every call.
+_NEXUS_TOKEN  = os.environ.get("NEXUS_INTERNAL_TOKEN", "")
+_PUBLIC_PATHS = {"/health"}
+
+@_flask_app.before_request
+def _require_nexus_token():
+    if request.path in _PUBLIC_PATHS:
+        return None
+    if not _NEXUS_TOKEN:
+        return None   # unset var = fail-open (warned at server start)
+    if request.headers.get("X-Nexus-Token", "") != _NEXUS_TOKEN:
+        return jsonify({"error": "unauthorized"}), 401
 
 
 def _bot_state_dict(bot) -> dict:
@@ -84,7 +107,7 @@ def _bot_state_dict(bot) -> dict:
 def health():
     return jsonify({
         "ok":         True,
-        "version":    "phase4-v2.1",
+        "version":    "phase4-v2.2",
         "uptime_min": int((time.time() - _start_time) / 60),
     })
 
@@ -187,6 +210,10 @@ def start_server(bots: list, port: int = None):
     _bots = bots
     if port is None:
         port = int(os.environ.get("PORT", 8081))
+
+    if not _NEXUS_TOKEN:
+        print("[PHASE4-SERVER] \u26a0 NEXUS_INTERNAL_TOKEN not set -- "
+              "/close_all and /resume are UNAUTHENTICATED (fail-open)", flush=True)
 
     def _run():
         print(f"[PHASE4-SERVER] Flask /think server starting on port {port}", flush=True)
