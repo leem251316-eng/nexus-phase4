@@ -1,5 +1,16 @@
 """
-NEXUS PHASE 4 — PER-SYMBOL AUTONOMOUS BOTS V2.9
+NEXUS PHASE 4 — PER-SYMBOL AUTONOMOUS BOTS V2.10
+
+V2.10 — 5-min fetch was BROKEN since V2.0 (Jul 6 2026):
+  ✅ TimeFrame(5, "Min") raises AttributeError inside alpaca-py -- it needs
+     TimeFrameUnit.Minute, not a raw string. The bare except swallowed it,
+     so every 5m Alpaca fetch fell back to rate-limited yfinance and
+     usually returned NOTHING. Consequences, live since the Alpaca
+     migration: _underlying_5m context was empty (trending_up_5m, at_high,
+     and the 5m half of tide logic ran on defaults), and V2.9's 5m warmup
+     stopgap never engaged (NUGT/LABU still stuck at 18/40 this morning
+     while Berserker fired). Constructor fixed; Alpaca fetch failures now
+     log once per symbol/interval instead of dying silently.
 
 V2.9 — Best-available data: 5-min stopgap for thin 1-min tape (Jul 6 2026):
   ✅ refresh_prices() and the SPY/QQQ context fetch now fall back to 5-min
@@ -115,7 +126,7 @@ except ImportError:
 try:
     from alpaca.data import StockHistoricalDataClient
     from alpaca.data.requests import StockBarsRequest
-    from alpaca.data.timeframe import TimeFrame
+    from alpaca.data.timeframe import TimeFrame, TimeFrameUnit
     _alpaca_data_ok = True
 except ImportError:
     _alpaca_data_ok = False
@@ -339,6 +350,7 @@ _analyst_scores_cache: dict  = {}
 _analyst_scores_ts:    float = 0.0
 _analyst_scores_ttl:   float = 20.0
 _analyst_lock                = threading.Lock()
+_alpaca_fetch_warned: set    = set()   # V2.10: one-time Alpaca fetch failure log keys
 _phase4_memory = None
 _capital_coordinator = None  # CapitalCoordinator -- initialized in run(), see capital_coordinator.py
 
@@ -604,7 +616,13 @@ def fetch_prices_and_volumes(symbol: str, bars: int = 40, interval: str = "1m") 
 
     if _data_client is not None and not symbol.startswith("^"):
         try:
-            tf       = TimeFrame.Minute if interval == "1m" else TimeFrame(5, "Min")
+            # V2.10: TimeFrame(5, "Min") raised AttributeError inside alpaca-py
+            # (needs the TimeFrameUnit enum, not a raw string) -- swallowed by
+            # this except since the V2.0 migration, so EVERY 5m Alpaca fetch
+            # silently fell to rate-limited yfinance and usually returned
+            # nothing: _underlying_5m context ran on defaults, and V2.9's
+            # 5m warmup stopgap never actually engaged.
+            tf       = TimeFrame.Minute if interval == "1m" else TimeFrame(5, TimeFrameUnit.Minute)
             lookback = timedelta(days=2) if interval == "1m" else timedelta(days=7)
             req      = StockBarsRequest(
                 symbol_or_symbols=alpaca_sym,
@@ -620,8 +638,15 @@ def fetch_prices_and_volumes(symbol: str, bars: int = 40, interval: str = "1m") 
                 volumes = df["volume"].tail(bars).tolist()
                 if prices:
                     return prices, volumes
-        except Exception:
-            pass
+        except Exception as _fe:
+            # V2.10: this except hid the broken 5m constructor for 6 days of
+            # live trading. Log once per (symbol, interval) so Alpaca-path
+            # failures are never invisible again.
+            _k = f"{symbol}:{interval}"
+            if _k not in _alpaca_fetch_warned:
+                _alpaca_fetch_warned.add(_k)
+                print(f"[P4 DATA] \u26a0 Alpaca {interval} fetch failed for {symbol}: "
+                      f"{type(_fe).__name__}: {_fe} -- falling back to yfinance", flush=True)
 
     # Fallback: yfinance (used for ^VIX and when Alpaca fails)
     try:
@@ -1898,7 +1923,7 @@ class SymbolBot:
 # ── Phase4 Service ────────────────────────────────────────────────────────────
 def run():
     global _phase4_memory, _capital_coordinator, _win_follower
-    print("[PHASE4] NEXUS PHASE 4 V2.9 STARTING — Alpaca Edition", flush=True)
+    print("[PHASE4] NEXUS PHASE 4 V2.10 STARTING — Alpaca Edition", flush=True)
     print("[PHASE4] Broker: Alpaca | Fractional shares | Real-time IEX feed", flush=True)
     print(f"[PHASE4] Bots: NUGT(30%) | SOXL(25%) | LABU(25%) | TQQQ(20%) base — V2.4 reweights hourly by rolling WR", flush=True)
     print(f"[PHASE4] Bear pairs: DUST | SOXS | LABD" + (" | SQQQ" if SQQQ_ENABLED else " | SQQQ(DISABLED)"), flush=True)
@@ -1966,7 +1991,7 @@ def run():
 
     vix_now = get_vix()
     alert(
-        f"⚡ PHASE4 V2.9 ONLINE — Alpaca Edition\n"
+        f"⚡ PHASE4 V2.10 ONLINE — Alpaca Edition\n"
         f"Win Follower: budgets reweight hourly by 14d WR (±8pts, 10% floor)\n"
         f"SOXL(SMH) TQQQ(QQQ) NUGT(GDX) LABU(XBI)\n"
         f"VIX: {vix_now:.1f} | SQQQ: {'ON' if SQQQ_ENABLED else 'OFF'}\n"
