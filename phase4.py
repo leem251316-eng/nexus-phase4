@@ -1,5 +1,12 @@
 """
-NEXUS PHASE 4 — PER-SYMBOL AUTONOMOUS BOTS V2.10
+NEXUS PHASE 4 — PER-SYMBOL AUTONOMOUS BOTS V2.11
+
+V2.11 — Fallback threshold 21 -> 35 (Jul 6 2026):
+  ✅ NUGT trapped at exactly 21 1m bars: cleared the 5m-fallback check but
+     failed warmup's 40. Also, 21-34 sparse IEX bars compute StochRSI/ADX
+     as defaults (both need 33) with gap-distorted values. Now: < 35 real
+     1m bars -> 5m stopgap; >= 35 -> full 1m resolution. Auto-revert logic
+     unchanged.
 
 V2.10 — 5-min fetch was BROKEN since V2.0 (Jul 6 2026):
   ✅ TimeFrame(5, "Min") raises AttributeError inside alpaca-py -- it needs
@@ -673,7 +680,13 @@ def fetch_prices(symbol: str, bars: int = 40) -> list:
 # full 1-min resolution automatically the moment 1m depth reaches
 # MIN_LIVE_BARS. Price-level exits (stops/trails/ratchets) are unaffected;
 # only indicator cadence is coarser while the stopgap is active.
-MIN_LIVE_BARS = 21   # get_signal_suite / get_spy_context need 21 bars
+# V2.11: raised 21 -> 35. NUGT sat at exactly 21 1-min bars: enough to
+# skip the 5m fallback, not enough to pass warmup (40) -- trapped between
+# thresholds. And 21 sparse IEX bars on a thin ticker are WORSE data than
+# 45 clean 5m bars: StochRSI and ADX need 33 bars (returning defaults
+# below that), and sparse 1m bars have missing minutes that distort every
+# indicator. 35 = full indicator suite on real 1m data, or 5m stopgap.
+MIN_LIVE_BARS = 35
 
 def fetch_prices_with_fallback(symbol: str, bars: int) -> tuple:
     """Returns (prices, volumes, timeframe_label). 1m preferred, 5m stopgap."""
@@ -1923,7 +1936,7 @@ class SymbolBot:
 # ── Phase4 Service ────────────────────────────────────────────────────────────
 def run():
     global _phase4_memory, _capital_coordinator, _win_follower
-    print("[PHASE4] NEXUS PHASE 4 V2.10 STARTING — Alpaca Edition", flush=True)
+    print("[PHASE4] NEXUS PHASE 4 V2.11 STARTING — Alpaca Edition", flush=True)
     print("[PHASE4] Broker: Alpaca | Fractional shares | Real-time IEX feed", flush=True)
     print(f"[PHASE4] Bots: NUGT(30%) | SOXL(25%) | LABU(25%) | TQQQ(20%) base — V2.4 reweights hourly by rolling WR", flush=True)
     print(f"[PHASE4] Bear pairs: DUST | SOXS | LABD" + (" | SQQQ" if SQQQ_ENABLED else " | SQQQ(DISABLED)"), flush=True)
@@ -1991,7 +2004,7 @@ def run():
 
     vix_now = get_vix()
     alert(
-        f"⚡ PHASE4 V2.10 ONLINE — Alpaca Edition\n"
+        f"⚡ PHASE4 V2.11 ONLINE — Alpaca Edition\n"
         f"Win Follower: budgets reweight hourly by 14d WR (±8pts, 10% floor)\n"
         f"SOXL(SMH) TQQQ(QQQ) NUGT(GDX) LABU(XBI)\n"
         f"VIX: {vix_now:.1f} | SQQQ: {'ON' if SQQQ_ENABLED else 'OFF'}\n"
