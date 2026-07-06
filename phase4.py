@@ -1,5 +1,12 @@
 """
-NEXUS PHASE 4 — PER-SYMBOL AUTONOMOUS BOTS V2.11
+NEXUS PHASE 4 — PER-SYMBOL AUTONOMOUS BOTS V2.12
+
+V2.12 — TTL fetch cache: stop burning the shared Alpaca budget (Jul 6 2026):
+  ✅ V2.10's loud logging exposed Alpaca 429s. One API key serves ALL
+     NEXUS services (~200 req/min) -- Berserker's exit-check sweeps compete
+     with Phase4's fetches. Cache: 1m bars 10s TTL (dedupes bot vs context
+     thread), 5m bars 240s TTL (they can't change for 5 min anyway).
+     Cuts Phase4's API call volume ~60-70%. Non-empty results only.
 
 V2.11 — Fallback threshold 21 -> 35 (Jul 6 2026):
   ✅ NUGT trapped at exactly 21 1m bars: cleared the 5m-fallback check but
@@ -618,8 +625,27 @@ def place_sell_all(symbol: str) -> bool:
         return False
 
 # ── Price data (Alpaca + yfinance fallback) ───────────────────────────────────
+# V2.12: TTL fetch cache. The V2.10 loud logging exposed Alpaca 429s
+# ("too many requests") -- every NEXUS service shares one API key and its
+# ~200 req/min budget, and Berserker's price sweeps (exit checks!) compete
+# with Phase4's fetches. Two kinds of waste this kills: (1) 5m bars can't
+# change for 5 minutes but were re-fetched every 12s loop; (2) the same
+# symbol (e.g. SMH) is fetched by both a bot thread and the context
+# thread within seconds. Non-empty results only; thread-safe.
+_fetch_cache: dict = {}
+_fetch_cache_lock  = threading.Lock()
+_FETCH_TTL         = {"1m": 10, "5m": 240}   # seconds
+
 def fetch_prices_and_volumes(symbol: str, bars: int = 40, interval: str = "1m") -> tuple:
     alpaca_sym = symbol.replace("^", "")
+
+    # V2.12: serve from cache when fresh
+    _ck  = (symbol, interval, bars)
+    _now = time.time()
+    with _fetch_cache_lock:
+        _hit = _fetch_cache.get(_ck)
+        if _hit and _now - _hit[0] < _FETCH_TTL.get(interval, 10):
+            return list(_hit[1]), list(_hit[2])
 
     if _data_client is not None and not symbol.startswith("^"):
         try:
@@ -644,6 +670,8 @@ def fetch_prices_and_volumes(symbol: str, bars: int = 40, interval: str = "1m") 
                 prices  = df["close"].tail(bars).tolist()
                 volumes = df["volume"].tail(bars).tolist()
                 if prices:
+                    with _fetch_cache_lock:
+                        _fetch_cache[_ck] = (_now, list(prices), list(volumes))
                     return prices, volumes
         except Exception as _fe:
             # V2.10: this except hid the broken 5m constructor for 6 days of
@@ -662,7 +690,11 @@ def fetch_prices_and_volumes(symbol: str, bars: int = 40, interval: str = "1m") 
         period = "1d" if interval == "1m" else "5d"
         df     = ticker.history(period=period, interval=interval)
         if not df.empty:
-            return df["Close"].tail(bars).tolist(), df["Volume"].tail(bars).tolist()
+            _p = df["Close"].tail(bars).tolist()
+            _v = df["Volume"].tail(bars).tolist()
+            with _fetch_cache_lock:
+                _fetch_cache[_ck] = (_now, list(_p), list(_v))
+            return _p, _v
     except Exception:
         pass
     return [], []
@@ -1936,7 +1968,7 @@ class SymbolBot:
 # ── Phase4 Service ────────────────────────────────────────────────────────────
 def run():
     global _phase4_memory, _capital_coordinator, _win_follower
-    print("[PHASE4] NEXUS PHASE 4 V2.11 STARTING — Alpaca Edition", flush=True)
+    print("[PHASE4] NEXUS PHASE 4 V2.12 STARTING — Alpaca Edition", flush=True)
     print("[PHASE4] Broker: Alpaca | Fractional shares | Real-time IEX feed", flush=True)
     print(f"[PHASE4] Bots: NUGT(30%) | SOXL(25%) | LABU(25%) | TQQQ(20%) base — V2.4 reweights hourly by rolling WR", flush=True)
     print(f"[PHASE4] Bear pairs: DUST | SOXS | LABD" + (" | SQQQ" if SQQQ_ENABLED else " | SQQQ(DISABLED)"), flush=True)
@@ -2004,7 +2036,7 @@ def run():
 
     vix_now = get_vix()
     alert(
-        f"⚡ PHASE4 V2.11 ONLINE — Alpaca Edition\n"
+        f"⚡ PHASE4 V2.12 ONLINE — Alpaca Edition\n"
         f"Win Follower: budgets reweight hourly by 14d WR (±8pts, 10% floor)\n"
         f"SOXL(SMH) TQQQ(QQQ) NUGT(GDX) LABU(XBI)\n"
         f"VIX: {vix_now:.1f} | SQQQ: {'ON' if SQQQ_ENABLED else 'OFF'}\n"
