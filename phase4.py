@@ -1,5 +1,14 @@
 """
-NEXUS PHASE 4 — PER-SYMBOL AUTONOMOUS BOTS V2.12
+NEXUS PHASE 4 — PER-SYMBOL AUTONOMOUS BOTS V2.13
+
+V2.13 — DUST/SOXS bear gates were mathematically unreachable (Jul 6 2026):
+  ✅ DUST min_score 7 with a max achievable score of 4; SOXS min_score 9
+     with a max of 6. Neither bear pair has EVER been able to enter --
+     with SQQQ flag-disabled, 3 of 4 reversal pairs were dead and every
+     NUGT/SOXL reversal watch was decorative. Clamped to the maximum
+     achievable score (ALL best signals required = perfect-setup-only,
+     the most selective reachable gate). The backtester runs both at 3;
+     re-derive from evidence on the next backtest pass.
 
 V2.12 — TTL fetch cache: stop burning the shared Alpaca budget (Jul 6 2026):
   ✅ V2.10's loud logging exposed Alpaca 429s. One API key serves ALL
@@ -271,7 +280,12 @@ BOT_CONFIGS = {
 BEAR_RECIPES = {
     "DUST": {
         "underlying":     "GDX",
-        "min_score":      7,
+        # V2.13: was 7 -- MATHEMATICALLY UNREACHABLE. Max achievable score
+        # = 4 best_signals, no bonus signals in list. DUST could never
+        # fire; every NUGT reversal watch was theater. 4 = ALL signals
+        # required (perfect-setup-only), the most selective reachable gate.
+        # Backtester runs this at 3; re-derive from evidence when re-run.
+        "min_score":      4,
         "atr_stop":       0.0180,
         "early_ratchet":  0.0134,
         "trail":          0.0033,
@@ -281,7 +295,10 @@ BEAR_RECIPES = {
     },
     "SOXS": {
         "underlying":     "SMH",
-        "min_score":      9,
+        # V2.13: was 9 -- MATHEMATICALLY UNREACHABLE. Max achievable score
+        # = 5 best_signals + rsi_lt25 bonus = 6. Same fix as DUST:
+        # 6 = ALL signals + bonus required. Backtester uses 3.
+        "min_score":      6,
         "atr_stop":       0.0177,
         "early_ratchet":  0.0120,
         "trail":          0.0032,
@@ -1968,7 +1985,7 @@ class SymbolBot:
 # ── Phase4 Service ────────────────────────────────────────────────────────────
 def run():
     global _phase4_memory, _capital_coordinator, _win_follower
-    print("[PHASE4] NEXUS PHASE 4 V2.12 STARTING — Alpaca Edition", flush=True)
+    print("[PHASE4] NEXUS PHASE 4 V2.13 STARTING — Alpaca Edition", flush=True)
     print("[PHASE4] Broker: Alpaca | Fractional shares | Real-time IEX feed", flush=True)
     print(f"[PHASE4] Bots: NUGT(30%) | SOXL(25%) | LABU(25%) | TQQQ(20%) base — V2.4 reweights hourly by rolling WR", flush=True)
     print(f"[PHASE4] Bear pairs: DUST | SOXS | LABD" + (" | SQQQ" if SQQQ_ENABLED else " | SQQQ(DISABLED)"), flush=True)
@@ -2036,7 +2053,7 @@ def run():
 
     vix_now = get_vix()
     alert(
-        f"⚡ PHASE4 V2.12 ONLINE — Alpaca Edition\n"
+        f"⚡ PHASE4 V2.13 ONLINE — Alpaca Edition\n"
         f"Win Follower: budgets reweight hourly by 14d WR (±8pts, 10% floor)\n"
         f"SOXL(SMH) TQQQ(QQQ) NUGT(GDX) LABU(XBI)\n"
         f"VIX: {vix_now:.1f} | SQQQ: {'ON' if SQQQ_ENABLED else 'OFF'}\n"
