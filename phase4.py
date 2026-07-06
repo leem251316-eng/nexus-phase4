@@ -1,5 +1,16 @@
 """
-NEXUS PHASE 4 — PER-SYMBOL AUTONOMOUS BOTS V2.8
+NEXUS PHASE 4 — PER-SYMBOL AUTONOMOUS BOTS V2.9
+
+V2.9 — Best-available data: 5-min stopgap for thin 1-min tape (Jul 6 2026):
+  ✅ refresh_prices() and the SPY/QQQ context fetch now fall back to 5-min
+     bars whenever the 1-min IEX tape is too thin to compute signals
+     (< 21 bars). Jul 6 boot evidence: NUGT and LABU sat at 12-14/40 bars
+     for 6+ minutes -- blind through exactly the oversold-open window this
+     strategy is built for. The 5m stopgap is NOT a mode: every refresh
+     tries 1m first and reverts automatically the moment 1m depth is
+     adequate. Transitions are logged (📶). Price-level exits
+     (stops/trails/ratchets) are unaffected -- only indicator cadence is
+     coarser while the stopgap is active.
 
 V2.8 — Fill-anchored entries + true recovery times (Jul 6 2026):
   ✅ Entry price now anchored to the ACTUAL Alpaca fill (brief poll after
@@ -628,6 +639,27 @@ def fetch_prices(symbol: str, bars: int = 40) -> list:
     p, _ = fetch_prices_and_volumes(symbol, bars)
     return p
 
+
+# V2.9: BEST-AVAILABLE DATA -- 1-min bars first; if the 1m tape is too thin
+# (< MIN_LIVE_BARS -- routine on NUGT/LABU on IEX right after boot or the
+# open), fall back to 5-min bars so the bot can trade instead of sitting
+# blind through exactly the oversold-open window it's built for. This is a
+# STOPGAP, not a mode: every refresh tries 1m first, so the bot reverts to
+# full 1-min resolution automatically the moment 1m depth reaches
+# MIN_LIVE_BARS. Price-level exits (stops/trails/ratchets) are unaffected;
+# only indicator cadence is coarser while the stopgap is active.
+MIN_LIVE_BARS = 21   # get_signal_suite / get_spy_context need 21 bars
+
+def fetch_prices_with_fallback(symbol: str, bars: int) -> tuple:
+    """Returns (prices, volumes, timeframe_label). 1m preferred, 5m stopgap."""
+    p, v = fetch_prices_and_volumes(symbol, bars, "1m")
+    if len(p) >= MIN_LIVE_BARS:
+        return p, v, "1m"
+    p5, v5 = fetch_prices_and_volumes(symbol, bars, "5m")
+    if len(p5) > len(p):
+        return p5, v5, "5m"
+    return p, v, "1m"
+
 def get_current_price(symbol: str) -> float | None:
     alpaca_sym = symbol.replace("^", "")
     if _data_client is not None and not symbol.startswith("^"):
@@ -826,8 +858,8 @@ def refresh_context_data():
     all_underlyings = ["SMH", "GDX", "XBI", "QQQ", "^VIX"]
     while True:
         try:
-            spy_p, _ = fetch_prices_and_volumes("SPY", 40)
-            qqq_p, _ = fetch_prices_and_volumes("QQQ", 40)
+            spy_p, _sv, _stf = fetch_prices_with_fallback("SPY", 40)
+            qqq_p, _qv, _qtf = fetch_prices_with_fallback("QQQ", 40)
             with _context_lock:
                 if spy_p: _spy_prices[:] = spy_p
                 if qqq_p: _qqq_prices[:] = qqq_p
@@ -1277,14 +1309,24 @@ class SymbolBot:
         self.cooldown_until = time.time() + secs
 
     def refresh_prices(self):
-        p, v = fetch_prices_and_volumes(self.symbol, WARMUP_BARS + 5)
+        # V2.9: best-available data -- 5m stopgap when the 1m tape is thin,
+        # auto-revert to 1m as soon as it's deep enough. Transitions logged.
+        p, v, tf = fetch_prices_with_fallback(self.symbol, WARMUP_BARS + 5)
         if p:
             self.prices  = p
             self.volumes = v
-        bp, bv = fetch_prices_and_volumes(self.bear_pair, WARMUP_BARS + 5)
+            if tf != getattr(self, "_data_tf", "1m"):
+                log(self.symbol, f"📶 {self.symbol} data: {tf} bars "
+                    f"({'1m tape thin -- 5m stopgap' if tf == '5m' else 'back to full 1m resolution'})")
+                self._data_tf = tf
+        bp, bv, btf = fetch_prices_with_fallback(self.bear_pair, WARMUP_BARS + 5)
         if bp:
             self.bear_prices  = bp
             self.bear_volumes = bv
+            if btf != getattr(self, "_bear_data_tf", "1m"):
+                log(self.symbol, f"📶 {self.bear_pair} data: {btf} bars "
+                    f"({'1m tape thin -- 5m stopgap' if btf == '5m' else 'back to full 1m resolution'})")
+                self._bear_data_tf = btf
 
     def get_signal_suite(self, prices: list, volumes: list) -> dict:
         if len(prices) < 21:
@@ -1856,7 +1898,7 @@ class SymbolBot:
 # ── Phase4 Service ────────────────────────────────────────────────────────────
 def run():
     global _phase4_memory, _capital_coordinator, _win_follower
-    print("[PHASE4] NEXUS PHASE 4 V2.8 STARTING — Alpaca Edition", flush=True)
+    print("[PHASE4] NEXUS PHASE 4 V2.9 STARTING — Alpaca Edition", flush=True)
     print("[PHASE4] Broker: Alpaca | Fractional shares | Real-time IEX feed", flush=True)
     print(f"[PHASE4] Bots: NUGT(30%) | SOXL(25%) | LABU(25%) | TQQQ(20%) base — V2.4 reweights hourly by rolling WR", flush=True)
     print(f"[PHASE4] Bear pairs: DUST | SOXS | LABD" + (" | SQQQ" if SQQQ_ENABLED else " | SQQQ(DISABLED)"), flush=True)
@@ -1924,7 +1966,7 @@ def run():
 
     vix_now = get_vix()
     alert(
-        f"⚡ PHASE4 V2.8 ONLINE — Alpaca Edition\n"
+        f"⚡ PHASE4 V2.9 ONLINE — Alpaca Edition\n"
         f"Win Follower: budgets reweight hourly by 14d WR (±8pts, 10% floor)\n"
         f"SOXL(SMH) TQQQ(QQQ) NUGT(GDX) LABU(XBI)\n"
         f"VIX: {vix_now:.1f} | SQQQ: {'ON' if SQQQ_ENABLED else 'OFF'}\n"
