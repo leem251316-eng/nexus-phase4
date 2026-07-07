@@ -1,5 +1,17 @@
 """
-NEXUS PHASE 4 — PER-SYMBOL AUTONOMOUS BOTS V2.13
+NEXUS PHASE 4 — PER-SYMBOL AUTONOMOUS BOTS V2.14
+
+V2.14 — Reversal drop-confirm before RSI reset + loud gate rejections (Jul 7 2026):
+  ✅ WATCHING checked "RSI < 60 -> reset" BEFORE the >=0.5% drop-confirm.
+     Violent flushes take RSI below 60 on the same bars that produce the
+     drop, so fast cracks reset the watch instead of firing it (Jul 7:
+     SOXL armed 6 watches at the top over 2h, RSI 84->24 flush fired
+     nothing). Drop-confirm now runs first; RSI collapsing WITH the crack
+     is confirmation. Slow-grind resets unchanged. Same wrong-order family
+     as V2.1's exit-priority fix.
+  ✅ Every reversal gate rejection now logs its reason (🚫 REVERSAL
+     REJECTED | gate=...) -- all paths were silent, making misses
+     undiagnosable without log forensics.
 
 V2.13 — DUST/SOXS bear gates were mathematically unreachable (Jul 6 2026):
   ✅ DUST min_score 7 with a max achievable score of 4; SOXS min_score 9
@@ -1579,42 +1591,69 @@ class SymbolBot:
             if now_t - state.get("watch_start", now_t) > REVERSAL_MAX_WATCH:
                 self.reversal_state = {"state": "IDLE"}
                 return False, 0
-            if bull_rsi < REVERSAL_RSI_RESET:
-                self.reversal_state = {"state": "IDLE"}
-                return False, 0
+            # V2.14: DROP-CONFIRM BEFORE THE RSI RESET. A violent flush
+            # drives RSI below 60 on the SAME bars that produce the >=0.5%
+            # drop -- the old order reset the watch before the drop check
+            # ever ran, so fast cracks (the profitable kind) systematically
+            # KILLED the watch instead of firing it, and re-arming needs
+            # RSI>=70 which a collapsing price never revisits. Jul 7
+            # evidence: SOXL armed 6 watches over 2h at the top, then RSI
+            # 84->24 midday flush fired NOTHING. Slow grinds still reset
+            # normally via the check below; RSI collapsing WITH the drop is
+            # the confirmation, not a reason to stand down. Same
+            # wrong-order family as the V2.1 exit-priority fix.
             bull_peak = max(state.get("bull_peak", self.prices[-1]), self.prices[-1])
             self.reversal_state["bull_peak"] = bull_peak
             drop = (bull_peak - self.prices[-1]) / bull_peak if bull_peak > 0 else 0
             if drop >= REVERSAL_CONFIRM:
+                # V2.14: every rejection now says WHY -- these paths were
+                # all silent, which made today's miss undiagnosable without
+                # log forensics.
+                reject = None
+                bear_ctx = None
                 if len(self.bear_prices) < 3 or self.bear_prices[-1] <= self.bear_prices[-3]:
-                    return False, 0
-                now_hour   = datetime.now(tz=CENTRAL).hour
-                bear_avoid = BEAR_RECIPES.get(self.bear_pair, {}).get("avoid_hours", [])
-                if now_hour in bear_avoid:
-                    return False, 0
-                if self.bear_pair == "SQQQ" and not SQQQ_ENABLED:
-                    return False, 0
-                qqq_ctx = get_qqq_context()
-                if qqq_ctx.get("oversold"):
-                    return False, 0
-                gate = QQQ_BEAR_RSI_GATE_LABD if self.bear_pair == "LABD" else QQQ_BEAR_RSI_GATE
-                if qqq_ctx.get("rsi", 50) < gate:
-                    return False, 0
-                bear_ctx   = self.get_signal_suite(self.bear_prices, self.bear_volumes)
-                bear_min   = BEAR_RECIPES.get(self.bear_pair, {}).get("min_score", 4)
-                bear_score = self.compute_entry_score(self.bear_pair, bear_ctx)
-                if bear_score < bear_min:
-                    return False, 0
-                if not bear_ctx.get("vol_confirmed", True):
-                    return False, 0
-                quality = self.score_reversal_quality(bull_rsi, drop, bear_ctx)
-                if quality == 0:
-                    return False, 0
+                    reject = "bear_not_bid"
+                if reject is None:
+                    now_hour   = datetime.now(tz=CENTRAL).hour
+                    bear_avoid = BEAR_RECIPES.get(self.bear_pair, {}).get("avoid_hours", [])
+                    if now_hour in bear_avoid:
+                        reject = f"bear_avoid_hour_{now_hour}"
+                if reject is None and self.bear_pair == "SQQQ" and not SQQQ_ENABLED:
+                    reject = "sqqq_disabled"
+                if reject is None:
+                    qqq_ctx = get_qqq_context()
+                    if qqq_ctx.get("oversold"):
+                        reject = "qqq_oversold"
+                    else:
+                        gate = QQQ_BEAR_RSI_GATE_LABD if self.bear_pair == "LABD" else QQQ_BEAR_RSI_GATE
+                        if qqq_ctx.get("rsi", 50) < gate:
+                            reject = f"qqq_rsi_{qqq_ctx.get('rsi', 50):.0f}<{gate}"
+                if reject is None:
+                    bear_ctx   = self.get_signal_suite(self.bear_prices, self.bear_volumes)
+                    bear_min   = BEAR_RECIPES.get(self.bear_pair, {}).get("min_score", 4)
+                    bear_score = self.compute_entry_score(self.bear_pair, bear_ctx)
+                    if bear_score < bear_min:
+                        reject = f"bear_score_{bear_score}<{bear_min}"
+                    elif not bear_ctx.get("vol_confirmed", True):
+                        reject = "vol_not_confirmed"
+                if reject is None:
+                    quality = self.score_reversal_quality(bull_rsi, drop, bear_ctx)
+                    if quality == 0:
+                        reject = "quality_0"
+                if reject is None:
+                    log(self.symbol,
+                        f"🔁 REVERSAL -> {self.bear_pair} | drop={round(drop*100,2)}% | "
+                        f"bull_rsi={bull_rsi:.1f} | bear_score={bear_score} | quality={quality}")
+                    self.reversal_state = {"state": "IDLE"}
+                    return True, quality
                 log(self.symbol,
-                    f"🔁 REVERSAL -> {self.bear_pair} | drop={round(drop*100,2)}% | "
-                    f"bull_rsi={bull_rsi:.1f} | bear_score={bear_score} | quality={quality}")
+                    f"🚫 REVERSAL REJECTED -> {self.bear_pair} | drop={round(drop*100,2)}% | "
+                    f"bull_rsi={bull_rsi:.1f} | gate={reject}")
+                # fall through to the RSI reset check below -- a rejected
+                # crack with collapsed RSI should end the watch normally
+            if bull_rsi < REVERSAL_RSI_RESET:
                 self.reversal_state = {"state": "IDLE"}
-                return True, quality
+                return False, 0
         return False, 0
 
     def try_buy(self, sym: str, prices: list, volumes: list,
@@ -1985,7 +2024,7 @@ class SymbolBot:
 # ── Phase4 Service ────────────────────────────────────────────────────────────
 def run():
     global _phase4_memory, _capital_coordinator, _win_follower
-    print("[PHASE4] NEXUS PHASE 4 V2.13 STARTING — Alpaca Edition", flush=True)
+    print("[PHASE4] NEXUS PHASE 4 V2.14 STARTING — Alpaca Edition", flush=True)
     print("[PHASE4] Broker: Alpaca | Fractional shares | Real-time IEX feed", flush=True)
     print(f"[PHASE4] Bots: NUGT(30%) | SOXL(25%) | LABU(25%) | TQQQ(20%) base — V2.4 reweights hourly by rolling WR", flush=True)
     print(f"[PHASE4] Bear pairs: DUST | SOXS | LABD" + (" | SQQQ" if SQQQ_ENABLED else " | SQQQ(DISABLED)"), flush=True)
@@ -2053,7 +2092,7 @@ def run():
 
     vix_now = get_vix()
     alert(
-        f"⚡ PHASE4 V2.13 ONLINE — Alpaca Edition\n"
+        f"⚡ PHASE4 V2.14 ONLINE — Alpaca Edition\n"
         f"Win Follower: budgets reweight hourly by 14d WR (±8pts, 10% floor)\n"
         f"SOXL(SMH) TQQQ(QQQ) NUGT(GDX) LABU(XBI)\n"
         f"VIX: {vix_now:.1f} | SQQQ: {'ON' if SQQQ_ENABLED else 'OFF'}\n"
