@@ -1,5 +1,8 @@
 """
 phase4_server.py — Thin Flask control server for nexus-phase4.
+V2.3: idle-bot RSI fixed — the /think builder imported a nonexistent
+      get_prices since V2.0; the except ate it, so idle bots always showed
+      "RSI None". Now reads bot.prices directly (no API call).
 V2.2: TOKEN LOCKDOWN — all routes except /health require X-Nexus-Token
       == NEXUS_INTERNAL_TOKEN. /close_all and /resume were publicly
       reachable with zero auth. Fail-open only when the env var is unset.
@@ -87,9 +90,12 @@ def _bot_state_dict(bot) -> dict:
         })
     else:
         try:
-            from phase4 import compute_rsi, get_prices
-            prices, _ = get_prices(bot.symbol)
-            rsi = compute_rsi(prices) if prices else None
+            # V2.3: `get_prices` never existed (it's fetch_prices) -- the
+            # import threw and this except ate it, so idle bots showed
+            # "RSI None" since the V2.0 migration. Use the bot's own
+            # refreshed price history: zero extra API calls.
+            from phase4 import compute_rsi
+            rsi = compute_rsi(bot.prices) if getattr(bot, "prices", None) else None
         except Exception:
             rsi = None
 
@@ -107,7 +113,7 @@ def _bot_state_dict(bot) -> dict:
 def health():
     return jsonify({
         "ok":         True,
-        "version":    "phase4-v2.2",
+        "version":    "phase4-v2.3",
         "uptime_min": int((time.time() - _start_time) / 60),
     })
 
