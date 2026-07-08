@@ -1,5 +1,12 @@
 """
 phase4_server.py — Thin Flask control server for nexus-phase4.
+V2.4: /close_one endpoint — Fleet Commander's /close SYMBOL now routes
+      Phase4 symbols here instead of flattening them directly against the
+      shared Alpaca account (which booked the PnL as a BERSERKER trade and
+      left the bot wedged in_position retrying a dead sell). Closes via
+      bot.try_sell so fill-anchoring, fingerprints, cooldowns, and daily
+      tallies all record properly. Also: /think version string was stale
+      (said V2.0 since the Alpaca migration).
 V2.3: idle-bot RSI fixed — the /think builder imported a nonexistent
       get_prices since V2.0; the except ate it, so idle bots always showed
       "RSI None". Now reads bot.prices directly (no API call).
@@ -113,7 +120,7 @@ def _bot_state_dict(bot) -> dict:
 def health():
     return jsonify({
         "ok":         True,
-        "version":    "phase4-v2.3",
+        "version":    "phase4-v2.4",
         "uptime_min": int((time.time() - _start_time) / 60),
     })
 
@@ -165,6 +172,33 @@ def close_all():
                     "closed_syms": closed, "failed": failed, "paused": True})
 
 
+@_flask_app.route("/close_one", methods=["POST"])
+def close_one():
+    """
+    V2.4: close a single Phase4 position by symbol (bull or bear leg).
+    Body: {"symbol": "SOXL"}. Called by Fleet Commander /close routing.
+    Does NOT set kill_paused -- this is a surgical close, not a killswitch.
+    """
+    import phase4
+    body   = request.get_json(silent=True) or {}
+    symbol = str(body.get("symbol", "")).upper().strip()
+    if not symbol:
+        return jsonify({"ok": False, "error": "symbol required"}), 400
+    for bot in _bots:
+        if bot.in_position and bot.active_sym == symbol:
+            try:
+                cp = phase4.get_current_price(symbol) or bot.entry_price
+            except Exception:
+                cp = bot.entry_price
+            pnl = ((cp - bot.entry_price) / bot.entry_price
+                   if bot.entry_price > 0 else 0.0)
+            ok = bot.try_sell("manual-close", pnl)
+            return jsonify({"ok": bool(ok), "symbol": symbol,
+                            "pnl_pct": round(pnl * 100, 3)})
+    return jsonify({"ok": False, "symbol": symbol,
+                    "error": "no Phase4 bot holds this symbol"}), 404
+
+
 @_flask_app.route("/resume", methods=["POST"])
 def resume():
     """V2.1: clears the killswitch pause (called by main.py /resume)."""
@@ -201,7 +235,7 @@ def think():
         now = datetime.now(tz=CENTRAL)
         return jsonify({
             "online":       True,
-            "version":      "V2.0",
+            "version":      "V2.4",
             "timestamp":    now.strftime("%H:%M:%S CDT"),
             "bots":         bots_dict,
             "buying_power": buying_power,
