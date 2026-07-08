@@ -1,5 +1,21 @@
 """
-NEXUS PHASE 4 — PER-SYMBOL AUTONOMOUS BOTS V2.14
+NEXUS PHASE 4 — PER-SYMBOL AUTONOMOUS BOTS V2.15
+
+V2.15 — External-close detection + fill-anchored exits (Jul 8 2026):
+  - place_sell_all now distinguishes 'gone' (account doesn't hold the
+    symbol -- closed by /close, manually, or a broker sweep) from a
+    transient failure. try_sell clears the bot's state on 'gone' and
+    records a '{reason}-external' exit fingerprint instead of retrying a
+    dead sell every 12s until redeploy (only /close_all had the phantom-
+    state clear before; the main loop was blind to it).
+  - Exits are FILL-ANCHORED: try_sell polls the close order's actual
+    average fill price and records that PnL. Entries got this in V2.8;
+    exits still booked the last bar price -- on 3x ETFs the bar-vs-fill
+    gap was flowing into fingerprints, Win Follower weights, and daily
+    tallies. Mirrors Berserker V10.37.
+  - _daily_limit_hit now actually tracked (P4_DAILY_LOSS_LIMIT_PCT env,
+    default 3.0 pct pts) -- /think reported the field since V2.0 but
+    nothing ever set it. Still NOT enforced; arming is a separate call.
 
 V2.14 — Reversal drop-confirm before RSI reset + loud gate rejections (Jul 7 2026):
   ✅ WATCHING checked "RSI < 60 -> reset" BEFORE the >=0.5% drop-confirm.
@@ -380,6 +396,11 @@ BUYING_POWER_BUFFER  = 1.05
 WIN_COOLDOWN_SECS    = 180
 LOSS_COOLDOWN_SECS   = 900
 LOOP_INTERVAL        = 12
+
+# V2.15: daily loss limit (percent points of daily_pnl) -- TRACKED ONLY,
+# not enforced. /think surfaces _daily_limit_hit; arming entry-blocking on
+# it is a separate, deliberate decision.
+DAILY_LOSS_LIMIT_PCT = float(os.environ.get("P4_DAILY_LOSS_LIMIT_PCT", "3.0"))
 WARMUP_BARS          = 40
 
 # ── Shared context data ───────────────────────────────────────────────────────
@@ -642,16 +663,33 @@ def get_fill_price(order, retries: int = 3, delay: float = 1.0) -> float:
         print(f"[P4 BROKER] fill poll failed: {e}", flush=True)
     return 0.0
 
-def place_sell_all(symbol: str) -> bool:
-    """Close entire position in symbol via Alpaca."""
+def place_sell_all(symbol: str) -> tuple:
+    """
+    Close entire position in symbol via Alpaca.
+    V2.15: returns (status, order) where status is:
+      'ok'   -- close submitted; order is the Alpaca order object (poll it
+                with get_fill_price for the actual exit fill)
+      'gone' -- the account doesn't hold this symbol (closed externally:
+                /close from Fleet Commander, manual, broker sweep). Caller
+                must clear its state instead of retrying forever -- the old
+                bool return made an externally-closed position a permanent
+                12s retry loop until redeploy (same blind spot Scanner
+                fixed in V2.13; only /close_all had the phantom-state
+                clear before this).
+      'fail' -- transient error; caller keeps the position and retries.
+    """
     if _trade_client is None:
-        return False
+        return ("fail", None)
     try:
-        _trade_client.close_position(symbol)
-        return True
+        order = _trade_client.close_position(symbol)
+        return ("ok", order)
     except Exception as e:
+        msg = str(e).lower()
+        if "does not exist" in msg or "position not found" in msg or "404" in msg:
+            print(f"[P4 BROKER] {symbol} not held (closed externally) -- clearing state", flush=True)
+            return ("gone", None)
         print(f"[P4 BROKER] close_position error {symbol}: {e}", flush=True)
-        return False
+        return ("fail", None)
 
 # ── Price data (Alpaca + yfinance fallback) ───────────────────────────────────
 # V2.12: TTL fetch cache. The V2.10 loud logging exposed Alpaca 429s
@@ -1380,6 +1418,12 @@ class SymbolBot:
         self.active_sym:   str   = symbol
         self.mode:         str   = "SCALP"
         self.cooldown_until: float = 0.0
+        # V2.15: daily-limit flag TRACKED ONLY (still not enforced -- boot
+        # banner says so; arming is Matthew's call). phase4_server /think
+        # has reported getattr(bot, "_daily_limit_hit", False) since V2.0
+        # but nothing ever SET it -- the field was permanently False. Set
+        # when daily_pnl (percent points) breaches DAILY_LOSS_LIMIT_PCT.
+        self._daily_limit_hit: bool = False
 
         self._bear_ext_trailing:   bool  = False
         self._bear_ext_peak:       float = 0.0
@@ -1804,8 +1848,56 @@ class SymbolBot:
         return False
 
     def try_sell(self, reason: str, pnl_pct: float) -> bool:
-        success = place_sell_all(self.active_sym)
+        status, _order = place_sell_all(self.active_sym)
+
+        # V2.15: EXTERNAL-CLOSE DETECTION. The position is already gone
+        # (Fleet Commander /close, manual, broker sweep). Record the exit
+        # with the quote PnL we were tracking, tag it -external so Friday
+        # digests can separate these, clear state, and DON'T count it
+        # against the win/loss cooldowns -- we didn't make this exit.
+        if status == "gone":
+            hold_min = int((time.time() - self.entry_time) / 60) if self.entry_time > 0 else 0
+            log(self.symbol,
+                f"🤝 {self.active_sym} closed externally | last P&L "
+                f"{round(pnl_pct*100,3):+.3f}% | held {hold_min}m -- clearing state")
+            alert(f"🤝 PHASE4: {self.active_sym} was closed externally | "
+                  f"{round(pnl_pct*100,3):+.3f}% | state cleared")
+            if _phase4_memory and self.trade_id:
+                _phase4_memory.record_exit(
+                    self.trade_id, pnl_pct > 0, pnl_pct,
+                    f"{reason}-external", hold_min, self.mfe, self.mae
+                )
+            self.in_position          = False
+            self.peak_price           = 0.0
+            self.entry_price          = 0.0
+            self.entry_time           = 0.0
+            self.trade_id             = ""
+            self.mfe                  = 0.0
+            self.mae                  = 0.0
+            self._bear_ext_trailing   = False
+            self._bear_ext_peak       = 0.0
+            self._late_ratchet_active = False
+            self.daily_pnl += pnl_pct * 100
+            if self.daily_pnl <= -DAILY_LOSS_LIMIT_PCT and not self._daily_limit_hit:
+                self._daily_limit_hit = True
+                log(self.symbol, f"⚠ Daily loss limit BREACHED (tracked, not enforced): {self.daily_pnl:+.2f}%")
+            return True
+
+        success = (status == "ok")
         if success:
+            # V2.15: FILL-ANCHORED EXIT -- entries got the fill anchor in
+            # V2.8 but exits still recorded the last bar price. On 3x ETFs
+            # intrabar moves of 0.2-0.5% are routine; the recorded PnL,
+            # fingerprints, Win Follower weights, and daily tallies were
+            # all inheriting the bar-vs-fill gap. Mirrors Berserker V10.37.
+            _fill = get_fill_price(_order)
+            if _fill > 0 and self.entry_price > 0:
+                _fill_pnl = (_fill - self.entry_price) / self.entry_price
+                if abs(_fill_pnl - pnl_pct) > 0.0005:
+                    log(self.symbol,
+                        f"⚓ Exit fill anchor: bar P&L {round(pnl_pct*100,3):+.3f}% "
+                        f"-> fill {round(_fill_pnl*100,3):+.3f}%")
+                pnl_pct = _fill_pnl
             emoji    = "✅" if pnl_pct > 0 else "🛑"
             pnl_s    = f"+{round(pnl_pct*100,3)}%" if pnl_pct > 0 else f"{round(pnl_pct*100,3)}%"
             hold_min = int((time.time() - self.entry_time) / 60) if self.entry_time > 0 else 0
@@ -1839,6 +1931,9 @@ class SymbolBot:
                 self.daily_losses += 1
                 self.set_cooldown(LOSS_COOLDOWN_SECS)
             self.daily_pnl += pnl_pct * 100
+            if self.daily_pnl <= -DAILY_LOSS_LIMIT_PCT and not self._daily_limit_hit:
+                self._daily_limit_hit = True
+                log(self.symbol, f"⚠ Daily loss limit BREACHED (tracked, not enforced): {self.daily_pnl:+.2f}%")
             return True
         return False
 
@@ -2024,7 +2119,7 @@ class SymbolBot:
 # ── Phase4 Service ────────────────────────────────────────────────────────────
 def run():
     global _phase4_memory, _capital_coordinator, _win_follower
-    print("[PHASE4] NEXUS PHASE 4 V2.14 STARTING — Alpaca Edition", flush=True)
+    print("[PHASE4] NEXUS PHASE 4 V2.15 STARTING — Alpaca Edition", flush=True)
     print("[PHASE4] Broker: Alpaca | Fractional shares | Real-time IEX feed", flush=True)
     print(f"[PHASE4] Bots: NUGT(30%) | SOXL(25%) | LABU(25%) | TQQQ(20%) base — V2.4 reweights hourly by rolling WR", flush=True)
     print(f"[PHASE4] Bear pairs: DUST | SOXS | LABD" + (" | SQQQ" if SQQQ_ENABLED else " | SQQQ(DISABLED)"), flush=True)
@@ -2092,12 +2187,12 @@ def run():
 
     vix_now = get_vix()
     alert(
-        f"⚡ PHASE4 V2.14 ONLINE — Alpaca Edition\n"
+        f"⚡ PHASE4 V2.15 ONLINE — Alpaca Edition\n"
         f"Win Follower: budgets reweight hourly by 14d WR (±8pts, 10% floor)\n"
         f"SOXL(SMH) TQQQ(QQQ) NUGT(GDX) LABU(XBI)\n"
         f"VIX: {vix_now:.1f} | SQQQ: {'ON' if SQQQ_ENABLED else 'OFF'}\n"
         f"Analyst: {'✅' if ANALYST_URL else '⚠ disabled'}\n"
-        f"V2.3: ADX regime filter + vol confirmation now live\n"
+        f"V2.15: External-close detection + fill-anchored exits\n"
         f"V2.2: Capital coordination (shared Alpaca account w/ Berserker)\n"
         f"V2.1: Exit priority fix — ratchet before rsi-overbought"
     )
@@ -2111,6 +2206,7 @@ def run():
                 bot.daily_wins   = 0
                 bot.daily_losses = 0
                 bot.daily_pnl    = 0.0
+                bot._daily_limit_hit = False   # V2.15
             last_day = today
             print("[PHASE4] 🌅 Daily reset", flush=True)
         time.sleep(60)
