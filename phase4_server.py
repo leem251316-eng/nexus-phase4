@@ -120,7 +120,7 @@ def _bot_state_dict(bot) -> dict:
 def health():
     return jsonify({
         "ok":         True,
-        "version":    "phase4-v2.4",
+        "version":    "phase4-v2.5",
         "uptime_min": int((time.time() - _start_time) / 60),
     })
 
@@ -170,6 +170,30 @@ def close_all():
     print(f"[PHASE4-SERVER] KILLSWITCH close_all: closed={closed} failed={failed} -- entries PAUSED", flush=True)
     return jsonify({"ok": len(failed) == 0, "closed": len(closed),
                     "closed_syms": closed, "failed": failed, "paused": True})
+
+
+@_flask_app.route("/manual_buy", methods=["POST"])
+def manual_buy():
+    """
+    V2.5: discretionary Phase4 buy by symbol (bull or bear leg), routed from
+    Fleet Commander /buyphase4. Body: {"symbol": "TQQQ", "usd": 50}.
+    Finds the bot that owns the symbol and calls bot.manual_open() so the
+    position is fully bot-managed. Token-gated by the global before_request.
+    """
+    body   = request.get_json(silent=True) or {}
+    symbol = str(body.get("symbol", "")).upper().strip()
+    try:
+        usd = float(body.get("usd", 0))
+    except (TypeError, ValueError):
+        usd = 0.0
+    if not symbol or usd <= 0:
+        return jsonify({"ok": False, "error": "symbol and positive usd required"}), 400
+    for bot in _bots:
+        if symbol in (bot.symbol, bot.bear_pair):
+            res = bot.manual_open(symbol, usd)
+            return jsonify(res), (200 if res.get("ok") else 409)
+    return jsonify({"ok": False, "symbol": symbol,
+                    "error": "no Phase4 bot manages this symbol"}), 404
 
 
 @_flask_app.route("/close_one", methods=["POST"])
@@ -235,7 +259,7 @@ def think():
         now = datetime.now(tz=CENTRAL)
         return jsonify({
             "online":       True,
-            "version":      "V2.4",
+            "version":      "V2.5",
             "timestamp":    now.strftime("%H:%M:%S CDT"),
             "bots":         bots_dict,
             "buying_power": buying_power,
