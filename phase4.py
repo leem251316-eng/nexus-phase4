@@ -1,5 +1,12 @@
 """
-NEXUS PHASE 4 — PER-SYMBOL AUTONOMOUS BOTS V2.15
+NEXUS PHASE 4 — PER-SYMBOL AUTONOMOUS BOTS V2.16
+
+V2.16 — Manual discretionary buy (Jul 15 2026):
+  BotState.manual_open(sym, usd): /buyphase4 from T-Bone. Bypasses entry
+  scoring ON PURPOSE; position is fully bot-managed (stops, ratchets,
+  MFE/MAE, external-close detection, fingerprints). mode set to SCALP
+  for exits; pattern memory records mode='MANUAL' for bucket isolation.
+  One position per bot, bull or bear leg, unchanged.
 
 V2.15 — External-close detection + fill-anchored exits (Jul 8 2026):
   - place_sell_all now distinguishes 'gone' (account doesn't hold the
@@ -1847,6 +1854,88 @@ class SymbolBot:
             return True
         return False
 
+    def manual_open(self, sym: str, usd: float) -> dict:
+        """
+        V2.16: discretionary buy from /buyphase4 (Fleet Commander). Bypasses
+        entry scoring/reversal gates ON PURPOSE -- Matthew's judgment call --
+        but the position lands in this bot's normal state machine, so stops,
+        ratchets, MFE/MAE, external-close detection, and fingerprints all
+        apply identically to a scored entry. sym must be this bot's bull
+        symbol or its bear pair; one position per bot, same as always.
+        self.mode is set to SCALP (the conservative exit profile); the
+        pattern-memory row records mode='MANUAL' so these trades are
+        isolated in the buckets and auditable later.
+        """
+        sym = sym.upper().strip()
+        if self.in_position:
+            return {"ok": False,
+                    "error": f"{self.symbol} bot already holds {self.active_sym}"}
+        if sym not in (self.symbol, self.bear_pair):
+            return {"ok": False,
+                    "error": f"{sym} not managed by the {self.symbol} bot"}
+        if usd <= 0:
+            return {"ok": False, "error": "amount must be positive"}
+        try:
+            price = get_current_price(sym) or 0.0
+        except Exception:
+            price = 0.0
+        if price <= 0:
+            return {"ok": False, "error": f"no price for {sym}"}
+
+        is_bear = (sym == self.bear_pair)
+        _res_id = _capital_coordinator.reserve(usd, symbol=sym) if _capital_coordinator else None
+        try:
+            _order  = place_order(sym, "BUY", usd)
+            success = _order is not None
+        finally:
+            if _capital_coordinator:
+                _capital_coordinator.release(_res_id)
+        if not success:
+            return {"ok": False, "error": f"order rejected for {sym}"}
+
+        import secrets
+        _fill = get_fill_price(_order)
+        entry_anchor = _fill if _fill > 0 else price
+        self.in_position           = True
+        self.active_sym            = sym
+        self.entry_price           = entry_anchor
+        self.peak_price            = entry_anchor
+        self.entry_time            = time.time()
+        self.mfe                   = 0.0
+        self.mae                   = 0.0
+        self.trade_id              = secrets.token_hex(8)
+        self.mode                  = "SCALP"       # conservative exit profile
+        self._entry_spy_ctx        = {}
+        self._entry_qqq_ctx        = {}
+        self._entry_sym_ctx        = {}
+        self._entry_rsi            = 50.0
+        self._entry_analyst_score  = 0
+        self._entry_signal_boost   = 0
+        self._entry_score          = 0
+        self._entry_rev_quality    = 0
+        self._entry_tide           = False
+        self._entry_vix            = 0.0
+        self._bear_ext_trailing    = False
+        self._bear_ext_peak        = entry_anchor
+        self._late_ratchet_active  = False
+
+        if _phase4_memory:
+            _phase4_memory.record_entry(
+                self.trade_id, self.symbol, self.bear_pair,
+                is_bear, "MANUAL", entry_anchor,
+                50.0, {}, {}, {}, 0, 0, 0, 0, False, 0.0
+            )
+
+        log(self.symbol,
+            f"⚡ MANUAL BUY: {sym} | ${usd:.2f} notional @ ~${entry_anchor:.3f} "
+            f"(fill-anchored) | exits=SCALP")
+        alert(
+            f"⚡ PHASE4 MANUAL BUY: {sym} | ${usd:.2f} @ ~${round(entry_anchor, 2)}\n"
+            f"Bot-managed (stops/ratchets/EOD apply). /close {sym} to exit."
+        )
+        return {"ok": True,
+                "msg": f"{sym} ${usd:.2f} @ ${entry_anchor:.3f}"}
+
     def try_sell(self, reason: str, pnl_pct: float) -> bool:
         status, _order = place_sell_all(self.active_sym)
 
@@ -2119,7 +2208,7 @@ class SymbolBot:
 # ── Phase4 Service ────────────────────────────────────────────────────────────
 def run():
     global _phase4_memory, _capital_coordinator, _win_follower
-    print("[PHASE4] NEXUS PHASE 4 V2.15 STARTING — Alpaca Edition", flush=True)
+    print("[PHASE4] NEXUS PHASE 4 V2.16 STARTING — Alpaca Edition", flush=True)
     print("[PHASE4] Broker: Alpaca | Fractional shares | Real-time IEX feed", flush=True)
     print(f"[PHASE4] Bots: NUGT(30%) | SOXL(25%) | LABU(25%) | TQQQ(20%) base — V2.4 reweights hourly by rolling WR", flush=True)
     print(f"[PHASE4] Bear pairs: DUST | SOXS | LABD" + (" | SQQQ" if SQQQ_ENABLED else " | SQQQ(DISABLED)"), flush=True)
@@ -2187,12 +2276,12 @@ def run():
 
     vix_now = get_vix()
     alert(
-        f"⚡ PHASE4 V2.15 ONLINE — Alpaca Edition\n"
+        f"⚡ PHASE4 V2.16 ONLINE — Alpaca Edition\n"
         f"Win Follower: budgets reweight hourly by 14d WR (±8pts, 10% floor)\n"
         f"SOXL(SMH) TQQQ(QQQ) NUGT(GDX) LABU(XBI)\n"
         f"VIX: {vix_now:.1f} | SQQQ: {'ON' if SQQQ_ENABLED else 'OFF'}\n"
         f"Analyst: {'✅' if ANALYST_URL else '⚠ disabled'}\n"
-        f"V2.15: External-close detection + fill-anchored exits\n"
+        f"V2.16: Manual buy (/buyphase4, bot-managed) | V2.15 external-close detection\n"
         f"V2.2: Capital coordination (shared Alpaca account w/ Berserker)\n"
         f"V2.1: Exit priority fix — ratchet before rsi-overbought"
     )
