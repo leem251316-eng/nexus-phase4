@@ -1,5 +1,9 @@
 """
-NEXUS PHASE 4 — PER-SYMBOL AUTONOMOUS BOTS V2.16
+NEXUS PHASE 4 — PER-SYMBOL AUTONOMOUS BOTS V2.17
+
+V2.17 — Phase B dashboard plumbing (Jul 22 2026):
+  alert() dual-writes to nexus_events; 60s heartbeat publishes per-bot
+  state to service_status. Fire-and-forget, no bot logic changed.
 
 V2.16 — Manual discretionary buy (Jul 15 2026):
   BotState.manual_open(sym, usd): /buyphase4 from T-Bone. Bypasses entry
@@ -588,7 +592,76 @@ def log(symbol, msg):
     ts = datetime.now(tz=CENTRAL).strftime("%H:%M:%S")
     print(f"[{symbol} | {ts}] {msg}", flush=True)
 
+# =============================================================================
+# V2.17 PHASE B: dashboard event feed + service heartbeat (mirrors main V10.56)
+# Dedicated short-lived autocommit connections, fire-and-forget. A DB hiccup
+# can never touch the bots.
+# =============================================================================
+_phaseb_ddl_done = False
+
+def _phaseb_write(sql, params=()):
+    global _phaseb_ddl_done
+    try:
+        import psycopg2 as _pg
+        _c = _pg.connect(os.environ["DATABASE_URL"], connect_timeout=5)
+        _c.autocommit = True
+        with _c.cursor() as _cur:
+            if not _phaseb_ddl_done:
+                _cur.execute("""
+                    CREATE TABLE IF NOT EXISTS nexus_events (
+                        id BIGSERIAL PRIMARY KEY, ts BIGINT NOT NULL,
+                        service VARCHAR(16) NOT NULL,
+                        severity VARCHAR(8) DEFAULT 'info', text TEXT NOT NULL);
+                """)
+                _cur.execute("""
+                    CREATE TABLE IF NOT EXISTS service_status (
+                        service VARCHAR(16) PRIMARY KEY, ts BIGINT NOT NULL,
+                        state JSONB NOT NULL);
+                """)
+                _phaseb_ddl_done = True
+            _cur.execute(sql, params)
+        _c.close()
+    except Exception:
+        try:
+            _c.close()
+        except Exception:
+            pass
+
+def _phaseb_event(text, severity="info"):
+    _phaseb_write(
+        "INSERT INTO nexus_events (ts, service, severity, text) VALUES (%s,%s,%s,%s)",
+        (int(time.time()), "phase4", severity, str(text)[:2000]))
+
+def _phaseb_heartbeat_start(bot_list):
+    """60s heartbeat: per-bot state for the dashboard."""
+    def _hb():
+        while True:
+            try:
+                st = {"version": "V2.17", "bots": {}}
+                for b in bot_list:
+                    try:
+                        st["bots"][b.symbol] = {
+                            "in_position": bool(b.in_position),
+                            "active_sym":  b.active_sym if b.in_position else None,
+                            "mode":        getattr(b, "mode", None) if b.in_position else None,
+                            "entry_price": getattr(b, "entry_price", None) if b.in_position else None,
+                        }
+                    except Exception:
+                        pass
+                _phaseb_write(
+                    "INSERT INTO service_status (service, ts, state) VALUES (%s,%s,%s) "
+                    "ON CONFLICT (service) DO UPDATE SET ts=EXCLUDED.ts, state=EXCLUDED.state",
+                    ("phase4", int(time.time()), json.dumps(st, default=str)))
+            except Exception:
+                pass
+            time.sleep(60)
+    threading.Thread(target=_hb, daemon=True, name="phaseb-heartbeat").start()
+
 def alert(msg):
+    try:
+        _phaseb_event(msg)
+    except Exception:
+        pass
     try:
         url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
         requests.post(url, data={"chat_id": TELEGRAM_CHAT_ID, "text": msg}, timeout=5)
@@ -2208,7 +2281,7 @@ class SymbolBot:
 # ── Phase4 Service ────────────────────────────────────────────────────────────
 def run():
     global _phase4_memory, _capital_coordinator, _win_follower
-    print("[PHASE4] NEXUS PHASE 4 V2.16 STARTING — Alpaca Edition", flush=True)
+    print("[PHASE4] NEXUS PHASE 4 V2.17 STARTING — Alpaca Edition", flush=True)
     print("[PHASE4] Broker: Alpaca | Fractional shares | Real-time IEX feed", flush=True)
     print(f"[PHASE4] Bots: NUGT(30%) | SOXL(25%) | LABU(25%) | TQQQ(20%) base — V2.4 reweights hourly by rolling WR", flush=True)
     print(f"[PHASE4] Bear pairs: DUST | SOXS | LABD" + (" | SQQQ" if SQQQ_ENABLED else " | SQQQ(DISABLED)"), flush=True)
@@ -2273,15 +2346,16 @@ def run():
 
     from phase4_server import start_server
     start_server(bots)
+    _phaseb_heartbeat_start(bots)   # V2.17 Phase B
 
     vix_now = get_vix()
     alert(
-        f"⚡ PHASE4 V2.16 ONLINE — Alpaca Edition\n"
+        f"⚡ PHASE4 V2.17 ONLINE — Alpaca Edition\n"
         f"Win Follower: budgets reweight hourly by 14d WR (±8pts, 10% floor)\n"
         f"SOXL(SMH) TQQQ(QQQ) NUGT(GDX) LABU(XBI)\n"
         f"VIX: {vix_now:.1f} | SQQQ: {'ON' if SQQQ_ENABLED else 'OFF'}\n"
         f"Analyst: {'✅' if ANALYST_URL else '⚠ disabled'}\n"
-        f"V2.16: Manual buy (/buyphase4, bot-managed) | V2.15 external-close detection\n"
+        f"V2.17: Dashboard feed + heartbeat | V2.16 manual buy | V2.15 ext-close\n"
         f"V2.2: Capital coordination (shared Alpaca account w/ Berserker)\n"
         f"V2.1: Exit priority fix — ratchet before rsi-overbought"
     )
