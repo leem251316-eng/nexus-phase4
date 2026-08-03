@@ -1,6 +1,14 @@
 """
-NEXUS PHASE 4 — PER-SYMBOL AUTONOMOUS BOTS V2.17
+NEXUS PHASE 4 — PER-SYMBOL AUTONOMOUS BOTS V2.18
 
+V2.18 — Regime shadow (Aug 2 2026, pre-registered):
+  B1+B3 joint rule observed, never enforced: every real entry signal and
+  every EOD overnight hold logs regime (ETF-MA20), the rule's action
+  (ALLOW / CARRY_ONLY / WOULD_CLOSE / WOULD_CARRY), and price to
+  phase4_shadow_signals via dedicated autocommit connections. Zero order
+  paths read shadow state. Evaluation at 30 sessions per
+  PHASE4_REGIME_SHADOW_PREREG.md; counterfactuals computed from bars at
+  verdict time.
 V2.17 — Phase B dashboard plumbing (Jul 22 2026):
   alert() dual-writes to nexus_events; 60s heartbeat publishes per-bot
   state to service_status. Fire-and-forget, no bot logic changed.
@@ -632,12 +640,53 @@ def _phaseb_event(text, severity="info"):
         "INSERT INTO nexus_events (ts, service, severity, text) VALUES (%s,%s,%s,%s)",
         (int(time.time()), "phase4", severity, str(text)[:2000]))
 
+# =============================================================================
+# V2.18 REGIME SHADOW (B1+B3 joint rule, pre-registered Aug 2 2026)
+# OBSERVATION ONLY — no order path reads any of this. Logs what the joint
+# rule (R1: trend entries ok / no overnight; R2: chop entries only as
+# designated carries) WOULD do at each real entry signal and each EOD hold.
+# Counterfactual P&L is computed at verdict time by the evaluation script
+# from bar data — nothing here updates rows later. Same dedicated
+# short-lived autocommit pattern as Phase B: a DB hiccup never touches bots.
+# =============================================================================
+_shadow_ddl_done = False
+
+def _shadow_event(kind, symbol, active_sym, regime, rule_action, actual_action, price, note=""):
+    global _shadow_ddl_done
+    try:
+        import psycopg2 as _pg
+        _c = _pg.connect(os.environ["DATABASE_URL"], connect_timeout=5)
+        _c.autocommit = True
+        with _c.cursor() as _cur:
+            if not _shadow_ddl_done:
+                _cur.execute("""
+                    CREATE TABLE IF NOT EXISTS phase4_shadow_signals (
+                        id BIGSERIAL PRIMARY KEY, ts BIGINT NOT NULL,
+                        kind VARCHAR(16) NOT NULL,
+                        symbol VARCHAR(8) NOT NULL, active_sym VARCHAR(8),
+                        regime VARCHAR(8), rule_action VARCHAR(16),
+                        actual_action VARCHAR(16), price REAL, note TEXT);
+                """)
+                _shadow_ddl_done = True
+            _cur.execute(
+                "INSERT INTO phase4_shadow_signals "
+                "(ts, kind, symbol, active_sym, regime, rule_action, actual_action, price, note) "
+                "VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s)",
+                (int(time.time()), kind, symbol, active_sym, regime,
+                 rule_action, actual_action, round(float(price), 4), str(note)[:500]))
+        _c.close()
+    except Exception:
+        try:
+            _c.close()
+        except Exception:
+            pass
+
 def _phaseb_heartbeat_start(bot_list):
     """60s heartbeat: per-bot state for the dashboard."""
     def _hb():
         while True:
             try:
-                st = {"version": "V2.17", "bots": {}}
+                st = {"version": "V2.18", "bots": {}}
                 for b in bot_list:
                     try:
                         st["bots"][b.symbol] = {
@@ -2166,6 +2215,23 @@ class SymbolBot:
                 if not is_market_hours():
                     if self.in_position:
                         log(self.symbol, "📌 Market closed — holding overnight")
+                        # V2.18 SHADOW: log the joint rule's EOD branch once/day.
+                        # R1 trend -> WOULD_CLOSE at this price; R2 chop -> WOULD_CARRY.
+                        try:
+                            _today = datetime.now(CENTRAL).strftime("%Y-%m-%d")
+                            if getattr(self, "_shadow_eod_date", None) != _today:
+                                self._shadow_eod_date = _today
+                                _ap = self.prices if self.active_sym == self.symbol else self.bear_prices
+                                _av = self.volumes if self.active_sym == self.symbol else self.bear_volumes
+                                _ctx = self.get_signal_suite(_ap, _av) if _ap else {}
+                                _regime = "TREND" if _ctx.get("above_ma20") else "CHOP"
+                                _rule   = "WOULD_CLOSE" if _regime == "TREND" else "WOULD_CARRY"
+                                _shadow_event("eod_hold", self.symbol, self.active_sym,
+                                              _regime, _rule, "HELD",
+                                              _ap[-1] if _ap else 0.0,
+                                              f"entry={self.entry_price:.4f}")
+                        except Exception:
+                            pass
                     time.sleep(60)
                     continue
 
@@ -2260,12 +2326,30 @@ class SymbolBot:
                             log(self.symbol, "⚠ Reversal but bear_prices empty — skip")
                         else:
                             bear_ctx = self.get_signal_suite(self.bear_prices, self.bear_volumes)
+                            # V2.18 SHADOW: annotate what the joint rule would do
+                            try:
+                                _regime = "TREND" if bear_ctx.get("above_ma20") else "CHOP"
+                                _rule   = "ALLOW" if _regime == "TREND" else "CARRY_ONLY"
+                                _shadow_event("entry_signal", self.symbol, self.bear_pair,
+                                              _regime, _rule, "ENTERED",
+                                              self.bear_prices[-1], f"bear rev_q={rev_quality}")
+                            except Exception:
+                                pass
                             self.try_buy(self.bear_pair, self.bear_prices, self.bear_volumes,
                                          spy_ctx, bear_ctx, reversal_quality=rev_quality)
                     else:
                         should_enter, score, reason = self.should_enter_bull(
                             spy_ctx, sym_ctx, underlying_ctx)
                         if should_enter:
+                            # V2.18 SHADOW: annotate what the joint rule would do
+                            try:
+                                _regime = "TREND" if sym_ctx.get("above_ma20") else "CHOP"
+                                _rule   = "ALLOW" if _regime == "TREND" else "CARRY_ONLY"
+                                _shadow_event("entry_signal", self.symbol, self.symbol,
+                                              _regime, _rule, "ENTERED",
+                                              prices[-1], f"bull score={score}")
+                            except Exception:
+                                pass
                             self.try_buy(self.symbol, prices, self.volumes, spy_ctx, sym_ctx)
                         elif score > 0:
                             log(self.symbol,
@@ -2281,7 +2365,7 @@ class SymbolBot:
 # ── Phase4 Service ────────────────────────────────────────────────────────────
 def run():
     global _phase4_memory, _capital_coordinator, _win_follower
-    print("[PHASE4] NEXUS PHASE 4 V2.17 STARTING — Alpaca Edition", flush=True)
+    print("[PHASE4] NEXUS PHASE 4 V2.18 STARTING — Alpaca Edition", flush=True)
     print("[PHASE4] Broker: Alpaca | Fractional shares | Real-time IEX feed", flush=True)
     print(f"[PHASE4] Bots: NUGT(30%) | SOXL(25%) | LABU(25%) | TQQQ(20%) base — V2.4 reweights hourly by rolling WR", flush=True)
     print(f"[PHASE4] Bear pairs: DUST | SOXS | LABD" + (" | SQQQ" if SQQQ_ENABLED else " | SQQQ(DISABLED)"), flush=True)
@@ -2350,12 +2434,12 @@ def run():
 
     vix_now = get_vix()
     alert(
-        f"⚡ PHASE4 V2.17 ONLINE — Alpaca Edition\n"
+        f"⚡ PHASE4 V2.18 ONLINE — Alpaca Edition\n"
         f"Win Follower: budgets reweight hourly by 14d WR (±8pts, 10% floor)\n"
         f"SOXL(SMH) TQQQ(QQQ) NUGT(GDX) LABU(XBI)\n"
         f"VIX: {vix_now:.1f} | SQQQ: {'ON' if SQQQ_ENABLED else 'OFF'}\n"
         f"Analyst: {'✅' if ANALYST_URL else '⚠ disabled'}\n"
-        f"V2.17: Dashboard feed + heartbeat | V2.16 manual buy | V2.15 ext-close\n"
+        f"V2.18: Regime shadow (B1+B3, no orders) | V2.17 dashboard feed | V2.16 manual buy\n"
         f"V2.2: Capital coordination (shared Alpaca account w/ Berserker)\n"
         f"V2.1: Exit priority fix — ratchet before rsi-overbought"
     )
