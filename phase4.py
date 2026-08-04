@@ -2326,31 +2326,35 @@ class SymbolBot:
                             log(self.symbol, "⚠ Reversal but bear_prices empty — skip")
                         else:
                             bear_ctx = self.get_signal_suite(self.bear_prices, self.bear_volumes)
-                            # V2.18 SHADOW: annotate what the joint rule would do
+                            _entered = self.try_buy(self.bear_pair, self.bear_prices, self.bear_volumes,
+                                                    spy_ctx, bear_ctx, reversal_quality=rev_quality)
+                            # V2.18 SHADOW: logged AFTER try_buy so actual_action
+                            # is the truth (gates/coord/rejection can veto).
                             try:
                                 _regime = "TREND" if bear_ctx.get("above_ma20") else "CHOP"
                                 _rule   = "ALLOW" if _regime == "TREND" else "CARRY_ONLY"
                                 _shadow_event("entry_signal", self.symbol, self.bear_pair,
-                                              _regime, _rule, "ENTERED",
+                                              _regime, _rule,
+                                              "ENTERED" if _entered else "SKIPPED",
                                               self.bear_prices[-1], f"bear rev_q={rev_quality}")
                             except Exception:
                                 pass
-                            self.try_buy(self.bear_pair, self.bear_prices, self.bear_volumes,
-                                         spy_ctx, bear_ctx, reversal_quality=rev_quality)
                     else:
                         should_enter, score, reason = self.should_enter_bull(
                             spy_ctx, sym_ctx, underlying_ctx)
                         if should_enter:
-                            # V2.18 SHADOW: annotate what the joint rule would do
+                            _entered = self.try_buy(self.symbol, prices, self.volumes, spy_ctx, sym_ctx)
+                            # V2.18 SHADOW: logged AFTER try_buy so actual_action
+                            # is the truth (gates/coord/rejection can veto).
                             try:
                                 _regime = "TREND" if sym_ctx.get("above_ma20") else "CHOP"
                                 _rule   = "ALLOW" if _regime == "TREND" else "CARRY_ONLY"
                                 _shadow_event("entry_signal", self.symbol, self.symbol,
-                                              _regime, _rule, "ENTERED",
+                                              _regime, _rule,
+                                              "ENTERED" if _entered else "SKIPPED",
                                               prices[-1], f"bull score={score}")
                             except Exception:
                                 pass
-                            self.try_buy(self.symbol, prices, self.volumes, spy_ctx, sym_ctx)
                         elif score > 0:
                             log(self.symbol,
                                 f"⏳ score={score} (need {self.cfg['min_score']}) | {reason}")
